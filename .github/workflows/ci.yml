@@ -1,0 +1,35 @@
+name: Server CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  server:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: rustup update stable --no-self-update
+      - name: Check public source manifest
+        run: python scripts/export_open_source.py --check
+      - name: Test source export boundaries
+        run: python -m unittest discover -s scripts -p test_export_open_source.py
+      - name: Export server without private engine files
+        run: python scripts/export_open_source.py --output .build/ci-public
+      - name: Build exported server
+        working-directory: .build/ci-public
+        run: cargo +stable build --workspace --locked
+      - name: Test exported server
+        working-directory: .build/ci-public
+        run: cargo +stable test --workspace --locked

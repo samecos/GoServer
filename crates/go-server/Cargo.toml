@@ -1,0 +1,23 @@
+[package]
+name = "go-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+go-core = { path = "../go-core" }
+go-protocol = { path = "../go-protocol" }
+tokio.workspace = true
+tonic.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+axum = { version = "0.8", features = ["ws"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }
+clap = { version = "4", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tokio-tungstenite = "0.28"
