@@ -1,3 +1,4 @@
+use crate::profiling::{Span, Stage};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
@@ -5,6 +6,50 @@ use thiserror::Error;
 
 pub(crate) type Key = [u8; 32];
 pub(crate) const REP_BOUND: usize = 11;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fast_legality_matches_full_move_simulation_through_random_games() {
+        let mut seed = 0x96208f735a123u64;
+        for size in [3, 5, 9, 19] {
+            for _ in 0..3 {
+                let mut position = Position::new(size, 7.5).unwrap();
+                for turn in 0..160 {
+                    let mut legal = Vec::new();
+                    for point in (0..size as u16 * size as u16).map(Some).chain([None]) {
+                        let simulated = position.board_after(point).is_ok();
+                        assert_eq!(
+                            position.legal_point(point),
+                            simulated,
+                            "size={size}, turn={turn}, point={point:?}, moves={:?}",
+                            position.moves()
+                        );
+                        if simulated {
+                            legal.push(point);
+                        }
+                    }
+                    assert!(!position.legal_point(Some(u16::MAX)));
+                    if position.terminal().is_some() {
+                        break;
+                    }
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    let point = legal[seed as usize % legal.len()];
+                    position
+                        .play(Move {
+                            color: position.to_move(),
+                            point,
+                        })
+                        .unwrap();
+                }
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -160,6 +205,7 @@ impl Position {
     }
     /// Exact replay identity, intentionally distinct from transposition identity.
     pub fn input_hash(&self) -> Key {
+        let _timer = Span::new(Stage::InputHash);
         let mut h = Sha256::new();
         h.update(b"go-input-chinese-v1");
         h.update([self.size]);
@@ -181,7 +227,7 @@ impl Position {
         if self.terminal.is_some() {
             return false;
         }
-        self.board_after(point).is_ok()
+        self.legal_point(point)
     }
     pub fn legal_moves(&self) -> Vec<Move> {
         if self.terminal.is_some() {
@@ -192,10 +238,11 @@ impl Position {
     /// Evaluator legal policy domain for a search-only friendly-pass node.
     /// Does not authorize continuing an externally completed game.
     pub fn legal_search_moves(&self) -> Vec<Move> {
+        let _timer = Span::new(Stage::LegalMoves);
         (0..self.board.len())
             .map(|p| Some(p as u16))
             .chain(std::iter::once(None))
-            .filter(|p| self.board_after(*p).is_ok())
+            .filter(|p| self.legal_point(*p))
             .map(|point| Move {
                 color: self.next,
                 point,
@@ -338,6 +385,31 @@ impl Position {
         }
         (stones, liberties)
     }
+    // Under the supported simple-ko/no-suicide rules, a move is legal if it
+    // has a direct liberty, connects to a friendly group with another liberty,
+    // or captures an adjacent enemy group. No successor board is needed here.
+    // Full play still uses board_after to apply captures and determine the ko.
+    fn legal_point(&self, point: Option<u16>) -> bool {
+        let Some(point) = point else {
+            return true;
+        };
+        let p = point as usize;
+        if p >= self.board.len() || self.board[p] != 0 || self.ko == Some(point) {
+            return false;
+        }
+        if self.neighbors(p).any(|a| self.board[a] == 0) {
+            return true;
+        }
+        self.neighbors(p).any(|a| {
+            let (_, liberties) = self.group(&self.board, a);
+            if self.board[a] == self.next.stone() {
+                liberties.len() > 1
+            } else {
+                liberties.len() == 1
+            }
+        })
+    }
+
     fn board_after(&self, point: Option<u16>) -> Result<(Vec<u8>, Option<u16>), PositionError> {
         let Some(point) = point else {
             return Ok((self.board.clone(), None));

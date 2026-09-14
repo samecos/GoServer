@@ -38,6 +38,17 @@
 
 ## 资源与验证边界
 
+选边采用线性最佳候选加按需堆排序，保留完整 PUCT 评分和同分顺序；合法着法枚举用相邻气和提子条件判断，实际落子仍执行完整规则模拟。评估完成时，只有能证明实际路径覆盖全部祖先且没有额外父引用时，才省略重复祖先刷新；转置和循环仍走通用刷新。
+
+CPU 性能诊断示例使用确定的合成评估与 FIFO 完成顺序，输出逐请求输入哈希和完整根快照；它不执行真实 NN，也不能用于判断棋力。默认不编入阶段计时；`search-profiling` 仅增加当前线程的诊断计时，嵌套阶段不能相加。
+
+```text
+cargo run -p go-core --example search_bench --release --locked -- 8000 3
+cargo run -p go-core --example search_bench --release --locked --features search-profiling -- 3000 1
+```
+
+可选 `SEARCH_BENCH_UNCERTAINTY=1` 覆盖非单位权重；`SEARCH_BENCH_POSITIONS` 可指向具备 id、boardSize、rules、komi、moves 的局面 JSON 列表。性能比较应先验证请求轨迹、访问计数、价值和权重一致，并避免其他编译或基准同时占用 CPU。
+
 图预算计入节点最大出边、逆向父引用、所有权、哈希表及在途历史等逻辑存储。`memory_bytes` 不等于进程 RSS；allocator、网络、临时遍历和数值缓存另有开销。预算不足时停止扩展；切根先取消任务，再回收不可达节点。
 
 进程共享的数值缓存不包含棋局或模型状态：Student-t CDF 初始化一次，分数效用积分格点按需初始化。缓存不改变原公式的积分顺序、舍入、钳位或插值。普通测试保留缓存前公式作为独立对照，并检验边界、固定随机输入和并发访问。

@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+[features]
+# Opt-in inclusive CPU stage timers for local experiments; absent in production.
+search-profiling = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

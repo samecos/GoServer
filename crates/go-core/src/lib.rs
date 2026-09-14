@@ -2,6 +2,8 @@
 //! Reference: KataGo 231e1c4b938f068628a5e3e59a3e842ad5fc92cd.
 //! See `REFERENCE.md` for the supported parameter profile and parity limits.
 mod position;
+#[doc(hidden)]
+pub mod profiling;
 mod search;
 mod value;
 

@@ -1,9 +1,11 @@
 use crate::position::Key;
+use crate::profiling::{Span, Stage};
 use crate::value::{expected_score_value, value_weight_cdf};
 use crate::{Color, Evaluation, Move, NodeStats, Position, Terminal};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use thiserror::Error;
 
 /// Deterministic KataGo-compatible parameter profile. Optional neural uncertainty
@@ -33,6 +35,36 @@ pub struct SearchConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lazy_edge_order_matches_full_sort_even_after_every_branch_is_blocked() {
+        let mut seed = 0x159ad34u64;
+        for count in [0, 1, 2, 19, 362] {
+            for _ in 0..16 {
+                let scored: Vec<_> = (0..count)
+                    .map(|index| {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        let score = match index % 13 {
+                            0 => -0.0,
+                            1 => 0.0,
+                            2 => f64::NEG_INFINITY,
+                            3 => f64::INFINITY,
+                            _ => (seed % 31) as f64 / 7.0,
+                        };
+                        ScoredEdge { index, score }
+                    })
+                    .collect();
+                let mut reference = scored.clone();
+                reference.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.index.cmp(&b.index)));
+                assert_eq!(
+                    EdgeOrder::new(scored).collect::<Vec<_>>(),
+                    reference.iter().map(|edge| edge.index).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
 
     fn stats(visits: u64, q: f64, weight: f64) -> NodeStats {
         NodeStats {
@@ -180,9 +212,9 @@ mod tests {
         let d = add_node(&mut s, 0.0, 2);
         link(&mut s, p, c, 1, 0);
         link(&mut s, p, d, 2, 1);
-        assert_eq!(s.ordered_edges(p)[0], 0);
+        assert_eq!(s.ordered_edges(p).next(), Some(0));
         s.nodes[p].edges[0].visits = 3;
-        assert_eq!(s.ordered_edges(p)[0], 1);
+        assert_eq!(s.ordered_edges(p).next(), Some(1));
     }
 
     #[test]
@@ -390,6 +422,64 @@ struct Edge {
     visits: u64,
     in_flight: u32,
 }
+
+// Most descents consume only the best edge. Defer ordering the rest until a
+// blocked/illegal branch requires it, retaining exactly the previous tie order.
+#[derive(Clone, Copy)]
+struct ScoredEdge {
+    index: usize,
+    score: f64,
+}
+impl PartialEq for ScoredEdge {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for ScoredEdge {}
+impl PartialOrd for ScoredEdge {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for ScoredEdge {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score
+            .total_cmp(&other.score)
+            .then(other.index.cmp(&self.index))
+    }
+}
+struct EdgeOrder {
+    first: Option<usize>,
+    remaining: Vec<ScoredEdge>,
+    heap: Option<BinaryHeap<ScoredEdge>>,
+}
+impl EdgeOrder {
+    fn new(scored: Vec<ScoredEdge>) -> Self {
+        let best = scored
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.cmp(b))
+            .map(|(i, _)| i);
+        Self {
+            first: best,
+            remaining: scored,
+            heap: None,
+        }
+    }
+}
+impl Iterator for EdgeOrder {
+    type Item = usize;
+    fn next(&mut self) -> Option<usize> {
+        if let Some(best) = self.first.take() {
+            return Some(self.remaining.swap_remove(best).index);
+        }
+        let _timer = Span::new(Stage::Selection);
+        self.heap
+            .get_or_insert_with(|| BinaryHeap::from(std::mem::take(&mut self.remaining)))
+            .pop()
+            .map(|edge| edge.index)
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
     Unevaluated,
@@ -535,6 +625,7 @@ impl Search {
         1024 + p.board().len() + p.moves().len() * 128
     }
     pub fn memory_bytes(&self) -> usize {
+        let _timer = Span::new(Stage::Memory);
         self.nodes.len().saturating_mul(self.node_charge())
             + self.position_charge(&self.position)
             + self
@@ -675,6 +766,7 @@ impl Search {
                 color: position.to_move(),
                 point: self.nodes[node].edges[edge_idx].point,
             };
+            let replay_timer = Span::new(Stage::Replay);
             let mut child_position = position.clone();
             // GraphHash's bounded history can intentionally share representatives;
             // actual path legality/terminal status is always checked, never copied.
@@ -685,6 +777,7 @@ impl Search {
             }
             let force_non_terminal = can_force_friendly && child_position.terminal().is_some();
             let key = Self::node_key(&child_position, force_non_terminal);
+            drop(replay_timer);
             let child = match self.nodes[node].edges[edge_idx].child {
                 Some(c) if self.nodes[c].key == key => c,
                 _ => {
@@ -763,7 +856,8 @@ impl Search {
         None
     }
 
-    fn ordered_edges(&self, node: usize) -> Vec<usize> {
+    fn ordered_edges(&self, node: usize) -> EdgeOrder {
+        let _timer = Span::new(Stage::Selection);
         let n = &self.nodes[node];
         let total: f64 = n
             .edges
@@ -787,7 +881,7 @@ impl Search {
                     / self.config.cpuct_exploration_base)
                     .ln())
             * (total + 0.01).sqrt();
-        let mut scored: Vec<(usize, f64)> = n
+        let scored: Vec<ScoredEdge> = n
             .edges
             .iter()
             .enumerate()
@@ -805,14 +899,13 @@ impl Search {
                         (loss - utility) * virtual_weight / (virtual_weight + weight.max(0.25));
                     weight += virtual_weight;
                 }
-                (
-                    i,
-                    n.color.white_sign() * utility + scale * e.prior / (1.0 + weight),
-                )
+                ScoredEdge {
+                    index: i,
+                    score: n.color.white_sign() * utility + scale * e.prior / (1.0 + weight),
+                }
             })
             .collect();
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-        scored.into_iter().map(|x| x.0).collect()
+        EdgeOrder::new(scored)
     }
 
     /// Invalid outputs leave ownership intact so the caller can fail/retry the
@@ -871,8 +964,13 @@ impl Search {
         self.nodes[p.node].edges = edges;
         self.nodes[p.node].ownership = evaluation.ownership;
         self.reserve_path(p.node, &p.path, false);
+        // Finish the leaf's idempotent normalization before updating its parents.
+        // On an unshared chain, commit_path then updates every ancestor already.
+        self.recompute(p.node);
         self.commit_path(&p.path);
-        self.refresh_ancestors(p.node);
+        if !self.path_covers_ancestors(p.node, &p.path) {
+            self.refresh_ancestors(p.node);
+        }
         self.evaluations_completed += 1;
         self.version += 1;
         Ok(Completion::Applied)
@@ -999,6 +1097,7 @@ impl Search {
     /// parent's edge statistics. Never append a descendant sample to a Q sum.
     /// KataGo searchupdatehelpers.cpp::recomputeNodeStats / downweightBadChildren.
     fn recompute(&mut self, node: usize) {
+        let _timer = Span::new(Stage::Recompute);
         let Some(raw) = self.nodes[node].raw else {
             return;
         };
@@ -1047,8 +1146,22 @@ impl Search {
         stats.normalize();
         self.nodes[node].stats = stats;
     }
+    fn path_covers_ancestors(&self, mut child: usize, path: &[(usize, usize)]) -> bool {
+        for &(parent, edge) in path.iter().rev() {
+            if self.nodes[child].parents.len() != 1
+                || !self.nodes[child].parents.contains(&parent)
+                || self.nodes[parent].edges[edge].child != Some(child)
+            {
+                return false;
+            }
+            child = parent;
+        }
+        child == self.root && self.nodes[child].parents.is_empty()
+    }
+
     // Only Q/weights are refreshed for other parents. They receive NO visits.
     fn refresh_ancestors(&mut self, changed: usize) {
+        let _timer = Span::new(Stage::Ancestors);
         let mut dirty = HashSet::new();
         let mut stack = vec![changed];
         while let Some(n) = stack.pop() {
@@ -1163,6 +1276,7 @@ impl Search {
         self.nodes = nodes;
     }
     pub fn snapshot(&self, limit: usize, pv_len: usize) -> SearchSnapshot {
+        let _timer = Span::new(Stage::Snapshot);
         let n = &self.nodes[self.root];
         let mut edges: Vec<_> = n.edges.iter().collect();
         edges.sort_by(|a, b| {

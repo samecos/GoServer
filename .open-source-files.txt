@@ -14,8 +14,10 @@ crates/go-core/LICENSE
 crates/go-core/REFERENCE.md
 crates/go-core/src/lib.rs
 crates/go-core/src/position.rs
+crates/go-core/src/profiling.rs
 crates/go-core/src/search.rs
 crates/go-core/src/value.rs
+crates/go-core/examples/search_bench.rs
 crates/go-core/tests/lifecycle.rs
 crates/go-core/tests/rules.rs
 crates/go-protocol/Cargo.toml
