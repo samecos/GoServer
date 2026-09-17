@@ -109,6 +109,10 @@ fn run(name: &str, window: usize, evaluations: usize) -> serde_json::Value {
     let mut search = Search::new(
         fixture(name),
         SearchConfig {
+            simd: std::env::var("SEARCH_BENCH_SIMD")
+                .unwrap_or_else(|_| "auto".into())
+                .parse()
+                .unwrap(),
             use_uncertainty: std::env::var("SEARCH_BENCH_UNCERTAINTY").is_ok_and(|v| v == "1"),
             max_nodes: evaluations + 1000,
             max_memory_bytes: 4 * 1024 * 1024 * 1024,
@@ -166,7 +170,7 @@ fn run(name: &str, window: usize, evaluations: usize) -> serde_json::Value {
         .zip(stats)
         .map(|(name, sample)| (name.into(), serde_json::to_value(sample).unwrap()))
         .collect();
-    json!({"fixture":name,"window":window,"evaluations":completed,"advanced":advanced,
+    json!({"fixture":name,"window":window,"evaluations":completed,"advanced":advanced,"simdBackend":search.simd_backend(),
         "useUncertainty":search.config().use_uncertainty,
         "seconds":elapsed,"evaluationsPerSecond":completed as f64/elapsed,
         "nextNs":next_ns,"completeNs":complete_ns,"syntheticEvaluatorNs":eval_ns,"snapshotNs":snapshot_ns,
@@ -179,6 +183,12 @@ fn main() {
     let evaluations = args.first().map_or(4000, |v| v.parse::<usize>().unwrap());
     let repeats = args.get(1).map_or(1, |v| v.parse::<usize>().unwrap());
     assert!(evaluations > 0 && repeats > 0);
+    let windows: Vec<usize> = std::env::var("SEARCH_BENCH_WINDOWS")
+        .unwrap_or_else(|_| "1,32".into())
+        .split(',')
+        .map(|v| v.parse::<usize>().expect("positive search window"))
+        .collect();
+    assert!(!windows.is_empty() && windows.iter().all(|&v| v > 0));
     let fixtures: Vec<String> = if let Ok(path) = std::env::var("SEARCH_BENCH_POSITIONS") {
         let entries: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
@@ -198,7 +208,7 @@ fn main() {
     std::hint::black_box(run(&fixtures[0], 1, 32));
     for repeat in 0..repeats {
         for fixture in &fixtures {
-            for window in [1, 32] {
+            for &window in &windows {
                 let mut result = run(fixture, window, evaluations);
                 result["repeat"] = json!(repeat);
                 println!("{result}");

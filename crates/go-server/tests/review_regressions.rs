@@ -287,10 +287,13 @@ fn configuration_reports_the_actual_search_and_session_limits() {
     };
     config.search.max_in_flight = 7;
     config.search.max_nodes = 1234;
+    config.search.simd = go_core::SearchSimd::Scalar;
     let sessions = Sessions::new(config, WorkerPool::new(None, Duration::from_secs(1)));
     let actual = sessions.configuration();
     assert_eq!(actual["search"]["max_in_flight"], 7);
     assert_eq!(actual["search"]["max_nodes"], 1234);
+    assert_eq!(actual["search"]["simd"], "scalar");
+    assert_eq!(actual["searchSimdSelected"], "scalar");
     assert_eq!(actual["publishMs"], 75);
     assert_eq!(actual["retentionSecs"], 17.0);
     assert_eq!(actual["maxSessions"], 11);

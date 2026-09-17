@@ -1,8 +1,13 @@
 //! Bounded per-connection observations. No per-request logging or wall-clock subtraction.
 use serde::Serialize;
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    sync::{LockResult, Mutex, MutexGuard},
+    time::{Duration, Instant},
+};
 
 const WINDOW: usize = 2048;
+const SNAPSHOT_CACHE_TTL: Duration = Duration::from_millis(100);
 
 #[derive(Default)]
 pub(crate) struct Samples {
@@ -10,7 +15,12 @@ pub(crate) struct Samples {
     count: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+struct SampleSnapshot {
+    values: Vec<f64>,
+    count: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Distribution {
     pub total_count: u64,
@@ -34,8 +44,22 @@ impl Samples {
         self.count += 1;
     }
 
-    pub fn view(&self) -> Distribution {
-        let mut sorted: Vec<_> = self.values.iter().copied().collect();
+    #[cfg(test)]
+    fn view(&self) -> Distribution {
+        self.snapshot().into_view()
+    }
+
+    fn snapshot(&self) -> SampleSnapshot {
+        SampleSnapshot {
+            values: self.values.iter().copied().collect(),
+            count: self.count,
+        }
+    }
+}
+
+impl SampleSnapshot {
+    fn into_view(self) -> Distribution {
+        let mut sorted = self.values;
         sorted.sort_unstable_by(f64::total_cmp);
         // Nearest-rank quantiles of the most recent WINDOW observations.
         let quantile = |percent: usize| {
@@ -71,9 +95,11 @@ pub(crate) struct Metrics {
     pub retired_rpc: Samples,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetricsView {
+    /// Age of the distribution sample snapshot; byte/message counters stay fresh.
+    pub distributions_age_ms: f64,
     /// Serialized outer protobuf envelope plus 5-byte gRPC header, not TCP traffic.
     pub request_bytes_enqueued: u64,
     pub request_bytes_streamed: u64,
@@ -91,22 +117,78 @@ pub struct MetricsView {
     pub retired_rpc: Distribution,
 }
 
-impl Metrics {
+struct CachedView {
+    sampled: Instant,
+    view: MetricsView,
+}
+
+/// Recording never waits for percentile sorting.
+/// Readers copy the bounded rings under `raw`, then sort without that lock.
+#[derive(Default)]
+pub(crate) struct MetricsStore {
+    raw: Mutex<Metrics>,
+    snapshot_cache: Mutex<Option<CachedView>>,
+}
+
+impl MetricsStore {
+    pub fn lock(&self) -> LockResult<MutexGuard<'_, Metrics>> {
+        self.raw.lock()
+    }
+
     pub fn view(&self) -> MetricsView {
-        MetricsView {
-            request_bytes_enqueued: self.request_bytes_enqueued,
-            request_bytes_streamed: self.request_bytes_streamed,
-            result_bytes_received: self.result_bytes_received,
-            result_messages_received: self.result_messages_received,
-            rpc: self.rpc.view(),
-            worker_elapsed: self.worker_elapsed.view(),
-            worker_queue: self.worker_queue.view(),
-            context: self.context.view(),
-            evaluator: self.evaluator.view(),
-            send_queue: self.send_queue.view(),
-            actor_wait: self.actor_wait.view(),
-            retired_rpc: self.retired_rpc.view(),
+        let sampled = Instant::now();
+        // Each distribution is internally consistent. Read one bounded ring at
+        // a time to keep its sorting buffer hot and release writers between
+        // distributions; this is not an atomic snapshot across all stages.
+        let mut view = MetricsView {
+            rpc: self.distribution(|m| &m.rpc),
+            worker_elapsed: self.distribution(|m| &m.worker_elapsed),
+            worker_queue: self.distribution(|m| &m.worker_queue),
+            context: self.distribution(|m| &m.context),
+            evaluator: self.distribution(|m| &m.evaluator),
+            send_queue: self.distribution(|m| &m.send_queue),
+            actor_wait: self.distribution(|m| &m.actor_wait),
+            retired_rpc: self.distribution(|m| &m.retired_rpc),
+            ..Default::default()
+        };
+        self.refresh_counters(&mut view);
+        view.distributions_age_ms = sampled.elapsed().as_secs_f64() * 1000.0;
+        view
+    }
+
+    pub fn snapshot_view(&self) -> MetricsView {
+        // Only readers take this lock. Coalesce concurrent game publications,
+        // while keeping dispatch/result recording independent of sorting.
+        let mut cache = self.snapshot_cache.lock().unwrap();
+        if cache
+            .as_ref()
+            .is_none_or(|cached| cached.sampled.elapsed() >= SNAPSHOT_CACHE_TTL)
+        {
+            let sampled = Instant::now();
+            *cache = Some(CachedView {
+                sampled,
+                view: self.view(),
+            });
         }
+        let cached = cache.as_ref().unwrap();
+        let mut view = cached.view.clone();
+        // Admission/completion boundary counters must not be cached.
+        self.refresh_counters(&mut view);
+        view.distributions_age_ms = cached.sampled.elapsed().as_secs_f64() * 1000.0;
+        view
+    }
+
+    fn refresh_counters(&self, view: &mut MetricsView) {
+        let raw = self.raw.lock().unwrap();
+        view.request_bytes_enqueued = raw.request_bytes_enqueued;
+        view.request_bytes_streamed = raw.request_bytes_streamed;
+        view.result_bytes_received = raw.result_bytes_received;
+        view.result_messages_received = raw.result_messages_received;
+    }
+
+    fn distribution(&self, select: impl FnOnce(&Metrics) -> &Samples) -> Distribution {
+        let snapshot = select(&self.raw.lock().unwrap()).snapshot();
+        snapshot.into_view()
     }
 }
 
@@ -131,5 +213,79 @@ mod tests {
         assert_eq!(v.total_count, 100 + WINDOW as u64);
         assert_eq!(v.window_count, WINDOW);
         assert_eq!(v.p99_ms, Some(0.0));
+    }
+
+    #[test]
+    fn ring_quantiles_match_chronological_window_through_wraps() {
+        let mut samples = Samples::default();
+        let mut history = std::collections::VecDeque::new();
+        for i in 0..WINDOW * 3 + 37 {
+            let value = ((i * 137) % 2048) as f64 / 100.0;
+            samples.record(value);
+            history.push_back(value);
+            if history.len() > WINDOW {
+                history.pop_front();
+            }
+            if i % 97 == 0 || i + 1 == WINDOW * 3 + 37 {
+                let view = samples.view();
+                let mut reference: Vec<_> = history.iter().copied().collect();
+                reference.sort_unstable_by(f64::total_cmp);
+                assert_eq!(view.total_count, (i + 1) as u64);
+                assert_eq!(view.window_count, reference.len());
+                assert_eq!(
+                    view.mean_ms,
+                    Some(reference.iter().sum::<f64>() / reference.len() as f64)
+                );
+                for (percent, actual) in [
+                    (50, view.p50_ms),
+                    (95, view.p95_ms),
+                    (99, view.p99_ms),
+                    (100, view.max_ms),
+                ] {
+                    assert_eq!(
+                        actual,
+                        Some(reference[(reference.len() * percent).div_ceil(100) - 1])
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_distributions_have_age_but_counters_and_explicit_reads_are_fresh() {
+        let store = MetricsStore::default();
+        store.lock().unwrap().rpc.record(2.0);
+        assert_eq!(store.snapshot_view().rpc.total_count, 1);
+        // Keep this cache fresh even when a debugger/loaded test runner pauses.
+        store
+            .snapshot_cache
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .sampled = Instant::now() + Duration::from_secs(3600);
+        {
+            let mut raw = store.lock().unwrap();
+            raw.rpc.record(4.0);
+            raw.result_messages_received = 2;
+            raw.result_bytes_received = 3400;
+        }
+        let cached = store.snapshot_view();
+        assert_eq!(cached.rpc.total_count, 1);
+        assert_eq!(cached.result_messages_received, 2);
+        assert_eq!(cached.result_bytes_received, 3400);
+        assert!(cached.distributions_age_ms >= 0.0);
+        assert_eq!(store.view().rpc.total_count, 2);
+        store
+            .snapshot_cache
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .sampled = Instant::now() - SNAPSHOT_CACHE_TTL;
+        let refreshed = store.snapshot_view();
+        assert_eq!(refreshed.rpc.total_count, 2);
+        assert_eq!(refreshed.rpc.p50_ms, Some(2.0));
+        assert_eq!(refreshed.rpc.p95_ms, Some(4.0));
     }
 }

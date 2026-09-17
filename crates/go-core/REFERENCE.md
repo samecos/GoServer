@@ -47,9 +47,19 @@ cargo run -p go-core --example search_bench --release --locked -- 8000 3
 cargo run -p go-core --example search_bench --release --locked --features search-profiling -- 3000 1
 ```
 
-可选 `SEARCH_BENCH_UNCERTAINTY=1` 覆盖非单位权重；`SEARCH_BENCH_POSITIONS` 可指向具备 id、boardSize、rules、komi、moves 的局面 JSON 列表。性能比较应先验证请求轨迹、访问计数、价值和权重一致，并避免其他编译或基准同时占用 CPU。
+可选 `SEARCH_BENCH_UNCERTAINTY=1` 覆盖非单位权重；`SEARCH_BENCH_POSITIONS` 可指向具备 id、boardSize、rules、komi、moves 的局面 JSON 列表；`SEARCH_BENCH_WINDOWS=1,32,128,512` 指定正整数在途窗口，默认仍为1、32。性能比较应先验证请求轨迹、访问计数、价值和权重一致，并避免其他编译或基准同时占用 CPU。
+
+### CPU SIMD 评分
+
+构建要求 Rust 1.89 或更新版本（见 [AVX-512 intrinsic 稳定版本](https://doc.rust-lang.org/core/arch/x86/fn._mm512_loadu_pd.html)）。`SearchConfig.simd` 支持 `auto`（默认）、`scalar`、`avx512`；`Search::simd_backend()` 返回已选择的内核。`auto` 仅在 x86-64 CPU 和操作系统均支持 AVX-512F 时启用8路 FP64候选评分，其余平台走原标量实现；显式请求不支持的 `avx512` 会返回配置错误。发行构建不需要全局 `target-cpu=native`。
+
+SIMD 处理相互独立的候选，仍使用精确除法、独立乘加及原 `total_cmp` 同分排序。已有子节点的边按原索引顺序收集，复用边权重；没有子节点的候选先按 FPU 批量评分，再覆盖已有子节点的完整 PUCT/virtual-loss 分数。非零求和项次序不变，省略的零项保留空集/非空集的零符号语义。每个启用 SIMD 的 Search 额外复用约17 KiB临时工作区；逻辑图计费公式不变，工作区不等于图内存预算。
+
+`SEARCH_BENCH_SIMD=scalar|auto|avx512` 选择基准内核，JSON 的 `simdBackend` 报告实际路径。工程收益应使用包含整理数据和搜索回传的完整 ABBA，而不是仅比较向量算术循环。测试覆盖浮点位级一致性、稀疏/共享子节点、候选尾部、完整同分顺序和工作区重复使用。AVX2 候选未通过本轮全部性能采用门，没有保留为发布选项。
 
 图预算计入节点最大出边、逆向父引用、所有权、哈希表及在途历史等逻辑存储。`memory_bytes` 不等于进程 RSS；allocator、网络、临时遍历和数值缓存另有开销。预算不足时停止扩展；切根先取消任务，再回收不可达节点。
+
+在途历史预算通过等价累计计费维护，失败/取消/完成只在真正移除任务时释放；无效回包不会提前释放。节点重算复用单写者的临时数组，保留原子节点顺序与浮点公式。当前局面的 situational SHA-256 直接读取已有劫历史末项，落子后仍按原字节格式计算一次；输入身份 Hash、图身份与 pass/循环语义不变。
 
 进程共享的数值缓存不包含棋局或模型状态：Student-t CDF 初始化一次，分数效用积分格点按需初始化。缓存不改变原公式的积分顺序、舍入、钳位或插值。普通测试保留缓存前公式作为独立对照，并检验边界、固定随机输入和并发访问。
 

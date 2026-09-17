@@ -16,6 +16,8 @@ crates/go-core/src/lib.rs
 crates/go-core/src/position.rs
 crates/go-core/src/profiling.rs
 crates/go-core/src/search.rs
+crates/go-core/src/search/scoring.rs
+crates/go-core/src/simd.rs
 crates/go-core/src/value.rs
 crates/go-core/examples/search_bench.rs
 crates/go-core/tests/lifecycle.rs
@@ -30,6 +32,9 @@ crates/go-server/src/lib.rs
 crates/go-server/src/main.rs
 crates/go-server/src/session.rs
 crates/go-server/src/worker.rs
+crates/go-server/src/worker_metrics.rs
+crates/go-server/src/worker_schedule.rs
+crates/go-server/src/worker_scheduling_tests.rs
 crates/go-server/tests/gtp.rs
 crates/go-server/tests/review_regressions.rs
 crates/go-server/tests/service.rs

@@ -1,12 +1,14 @@
 use crate::position::Key;
 use crate::profiling::{Span, Stage};
 use crate::value::{expected_score_value, value_weight_cdf};
-use crate::{Color, Evaluation, Move, NodeStats, Position, Terminal};
+use crate::{Color, Evaluation, Move, NodeStats, Position, SearchSimd, Terminal};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use thiserror::Error;
+
+mod scoring;
 
 /// Deterministic KataGo-compatible parameter profile. Optional neural uncertainty
 /// weighting uses the evaluator's short-term error outputs. Dynamic score utility,
@@ -14,6 +16,7 @@ use thiserror::Error;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SearchConfig {
+    pub simd: SearchSimd,
     pub max_nodes: usize,
     pub max_memory_bytes: usize,
     pub max_in_flight: usize,
@@ -247,6 +250,80 @@ mod tests {
     }
 
     #[test]
+    fn pending_memory_tracks_errors_cancellation_and_root_changes() {
+        let mut s = Search::new(Position::new(19, 7.5).unwrap(), SearchConfig::default()).unwrap();
+        let evaluation = Evaluation {
+            policy: vec![1.0 / 362.0; 362],
+            white_win_prob: 0.5,
+            white_loss_prob: 0.5,
+            white_no_result_prob: 0.0,
+            white_score_mean: 0.0,
+            white_score_mean_sq: 1.0,
+            white_lead: 0.0,
+            has_shortterm_error: false,
+            shortterm_winloss_error: -1.0,
+            shortterm_score_error: -1.0,
+            ownership: vec![],
+        };
+        let check = |s: &Search| {
+            let pending: usize = s
+                .pending
+                .values()
+                .map(|p| s.position_charge(&p.position) * 2 + p.path.len() * 32)
+                .sum();
+            assert_eq!(s.pending_memory_bytes, pending);
+            assert_eq!(
+                s.memory_bytes(),
+                s.nodes.len() * s.node_charge() + s.position_charge(&s.position) + pending
+            );
+        };
+        let mut tasks = Vec::new();
+        for _ in 0..64 {
+            if let SearchStep::Evaluate(request) = s.next_evaluation().unwrap() {
+                check(&s);
+                if tasks.len() < 8 {
+                    s.complete(request.token, evaluation.clone()).unwrap();
+                } else {
+                    let mut invalid = evaluation.clone();
+                    invalid.policy.clear();
+                    assert!(s.complete(request.token, invalid).is_err());
+                }
+                tasks.push(request.token);
+                check(&s);
+            }
+        }
+        assert!(s.in_flight() > 1);
+        for &token in tasks.iter().rev().take(3) {
+            assert_eq!(s.fail(token), Completion::Applied);
+            check(&s);
+            assert_eq!(s.fail(token), Completion::Stale);
+            check(&s);
+        }
+        let &token = tasks.iter().find(|t| s.pending.contains_key(t)).unwrap();
+        assert_eq!(
+            s.complete(token, evaluation.clone()).unwrap(),
+            Completion::Applied
+        );
+        check(&s);
+        assert_eq!(
+            s.complete(token, evaluation.clone()).unwrap(),
+            Completion::Stale
+        );
+        check(&s);
+        let cancelled = s.set_root(Position::new(19, 6.5).unwrap()).unwrap();
+        assert!(!cancelled.is_empty());
+        assert_eq!(s.pending_memory_bytes, 0);
+        check(&s);
+        for token in cancelled {
+            assert_eq!(
+                s.complete(token, evaluation.clone()).unwrap(),
+                Completion::Stale
+            );
+            check(&s);
+        }
+    }
+
+    #[test]
     fn pending_replay_memory_is_recoverable_and_allocated_nodes_can_retry() {
         fn evaluation() -> Evaluation {
             Evaluation {
@@ -328,6 +405,7 @@ mod tests {
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
+            simd: SearchSimd::Auto,
             max_nodes: 100_000,
             max_memory_bytes: 512 * 1024 * 1024,
             max_in_flight: 128,
@@ -528,11 +606,15 @@ struct Pending {
 /// avoid its leaf and can continue down independent paths.
 pub struct Search {
     config: SearchConfig,
+    simd: SearchSimd,
+    selection_scratch: Option<Box<scoring::Prepared>>,
     position: Position,
     nodes: Vec<Node>,
     index: HashMap<Key, usize>,
     root: usize,
     pending: HashMap<EvalToken, Pending>,
+    pending_memory_bytes: usize,
+    recompute_scratch: Vec<(NodeStats, f64)>,
     generation: u64,
     next_id: u64,
     version: u64,
@@ -579,13 +661,18 @@ impl Search {
         }
         let key = position.graph_key();
         let node = Node::new(&position);
+        let simd = config.simd.resolve().map_err(SearchError::Config)?;
         let s = Self {
+            simd,
+            selection_scratch: (simd != SearchSimd::Scalar).then(Box::default),
             config,
             position,
             nodes: vec![node],
             index: HashMap::from([(key, 0)]),
             root: 0,
             pending: HashMap::new(),
+            pending_memory_bytes: 0,
+            recompute_scratch: Vec::new(),
             generation: 1,
             next_id: 1,
             version: 0,
@@ -604,6 +691,9 @@ impl Search {
     }
     pub fn config(&self) -> &SearchConfig {
         &self.config
+    }
+    pub fn simd_backend(&self) -> SearchSimd {
+        self.simd
     }
     pub fn generation(&self) -> u64 {
         self.generation
@@ -628,11 +718,7 @@ impl Search {
         let _timer = Span::new(Stage::Memory);
         self.nodes.len().saturating_mul(self.node_charge())
             + self.position_charge(&self.position)
-            + self
-                .pending
-                .values()
-                .map(|p| self.position_charge(&p.position) * 2 + p.path.len() * 32)
-                .sum::<usize>()
+            + self.pending_memory_bytes
     }
 
     /// No further NN work can fit until the root changes. Pending replay storage
@@ -748,6 +834,7 @@ impl Search {
                         position,
                     },
                 );
+                self.pending_memory_bytes += extra;
                 return Some(SearchStep::Evaluate(request));
             }
             State::Terminal => return None,
@@ -856,9 +943,18 @@ impl Search {
         None
     }
 
-    fn ordered_edges(&self, node: usize) -> EdgeOrder {
+    fn ordered_edges(&mut self, node: usize) -> EdgeOrder {
         let _timer = Span::new(Stage::Selection);
         let n = &self.nodes[node];
+        if self.simd != SearchSimd::Scalar {
+            return scoring::prepared_scores(
+                self.simd,
+                n,
+                &self.nodes,
+                &self.config,
+                self.selection_scratch.as_deref_mut().expect("SIMD scratch"),
+            );
+        }
         let total: f64 = n
             .edges
             .iter()
@@ -946,6 +1042,7 @@ impl Search {
             return Err(SearchError::Evaluation("no positive legal policy mass"));
         }
         let p = self.pending.remove(&token).expect("validated pending task");
+        self.pending_memory_bytes -= self.position_charge(&p.position) * 2 + p.path.len() * 32;
         self.has_shortterm_error = Some(evaluation.has_shortterm_error);
         let raw = self.raw_stats(&evaluation);
         let edges = legal
@@ -979,6 +1076,7 @@ impl Search {
         let Some(p) = self.pending.remove(&token) else {
             return Completion::Stale;
         };
+        self.pending_memory_bytes -= self.position_charge(&p.position) * 2 + p.path.len() * 32;
         if self.nodes[p.node].state == State::Evaluating(token) {
             self.nodes[p.node].state = State::Unevaluated;
         }
@@ -1111,13 +1209,18 @@ impl Search {
             return;
         }
         let sign = self.nodes[node].color.white_sign();
-        let mut children: Vec<(NodeStats, f64)> = self.nodes[node]
-            .edges
-            .iter()
-            .filter_map(|e| e.child.map(|c| (self.nodes[c].stats, e.visits)))
-            .filter(|(s, v)| s.visits > 0 && s.weight_sum > 0.0 && *v > 0)
-            .map(|(s, v)| (s, s.child_weight(v)))
-            .collect();
+        // Recompute does not recurse. Keep the allocation between backups while
+        // preserving child order and every floating-point operation.
+        let mut children = std::mem::take(&mut self.recompute_scratch);
+        children.clear();
+        children.extend(
+            self.nodes[node]
+                .edges
+                .iter()
+                .filter_map(|e| e.child.map(|c| (self.nodes[c].stats, e.visits)))
+                .filter(|(s, v)| s.visits > 0 && s.weight_sum > 0.0 && *v > 0)
+                .map(|(s, v)| (s, s.child_weight(v))),
+        );
         let total: f64 = children.iter().map(|x| x.1).sum();
         if self.config.value_weight_exponent != 0.0 && total > 0.0 {
             let mean = children
@@ -1140,11 +1243,12 @@ impl Search {
             ..Default::default()
         };
         stats.add_weighted(raw, raw.weight_sum);
-        for (child, weight) in children {
+        for &(child, weight) in &children {
             stats.add_weighted(child, weight);
         }
         stats.normalize();
         self.nodes[node].stats = stats;
+        self.recompute_scratch = children;
     }
     fn path_covers_ancestors(&self, mut child: usize, path: &[(usize, usize)]) -> bool {
         for &(parent, edge) in path.iter().rev() {
