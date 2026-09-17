@@ -26,6 +26,9 @@ struct Args {
     max_nodes: usize,
     #[arg(long, default_value_t = 128)]
     max_in_flight: usize,
+    /// CPU candidate scoring: auto, scalar or avx512.
+    #[arg(long, default_value = "auto")]
+    search_simd: go_core::SearchSimd,
     /// Opt-in until heterogeneous GPU/network ABBA acceptance is complete.
     #[arg(long, value_enum, default_value_t = Scheduler::Legacy)]
     worker_scheduler: Scheduler,
@@ -79,10 +82,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("graph memory limit overflow")?;
     config.search.max_nodes = args.max_nodes;
     config.search.max_in_flight = args.max_in_flight;
+    config.search.simd = args.search_simd;
     config.max_sessions = args.max_sessions;
     config.retention = Duration::from_secs(args.session_retention_secs);
     config.publish = Duration::from_millis(args.publish_ms);
-    go_core::Search::new(go_core::Position::new(19, 7.5)?, config.search.clone())?;
+    let validated_search =
+        go_core::Search::new(go_core::Position::new(19, 7.5)?, config.search.clone())?;
+    tracing::info!(requested=?args.search_simd, selected=?validated_search.simd_backend(), "CPU search kernel selected");
+    drop(validated_search);
     let scheduling = SchedulingConfig {
         scheduler: args.worker_scheduler,
         target_inflight: args.worker_target_inflight,

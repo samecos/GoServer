@@ -18,6 +18,7 @@ mod tests {
             for _ in 0..3 {
                 let mut position = Position::new(size, 7.5).unwrap();
                 for turn in 0..160 {
+                    assert_eq!(position.current_ko_hash(), position.ko_hash());
                     let mut legal = Vec::new();
                     for point in (0..size as u16 * size as u16).map(Some).chain([None]) {
                         let simulated = position.board_after(point).is_ok();
@@ -195,7 +196,7 @@ impl Position {
         self.post_terminal_play
     }
     pub(crate) fn friendly_pass_would_force_non_terminal(&self) -> bool {
-        self.passes == 1 && !self.pass_history().contains(&self.ko_hash())
+        self.passes == 1 && !self.pass_history().contains(&self.current_ko_hash())
     }
     pub fn ko_point(&self) -> Option<u16> {
         self.ko
@@ -257,7 +258,7 @@ impl Position {
             return Err(PositionError::WrongPlayer);
         }
         let (board, ko) = self.board_after(m.point)?;
-        let before = self.ko_hash();
+        let before = self.current_ko_hash();
         let can_force_friendly = m.point.is_none() && self.friendly_pass_would_force_non_terminal();
         let spight_end = m.point.is_none() && self.pass_history().contains(&before);
         self.board = board;
@@ -332,15 +333,20 @@ impl Position {
         h.update(&self.board);
         h.finalize().into()
     }
+    fn current_ko_hash(&self) -> Key {
+        // new/play append the current situational hash, including after a pass
+        // clears the earlier history. No additional cache or invalidation state.
+        *self.ko_history.last().expect("current situational hash")
+    }
     fn state_hash(&self) -> Key {
         let mut h = Sha256::new();
         h.update(b"go-chinese-simple-area-v1");
-        h.update(self.ko_hash());
+        h.update(self.current_ko_hash());
         h.update(self.komi.to_le_bytes());
         h.update(self.ko.unwrap_or(u16::MAX).to_le_bytes());
         h.update(self.passes.to_le_bytes());
         h.update([
-            u8::from(self.passes >= 1 || self.pass_history().contains(&self.ko_hash())),
+            u8::from(self.passes >= 1 || self.pass_history().contains(&self.current_ko_hash())),
             u8::from(self.terminal.is_some()),
             u8::from(self.terminal == Some(Terminal::NoResult)),
         ]);

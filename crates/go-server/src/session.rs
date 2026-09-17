@@ -221,6 +221,7 @@ impl Sessions {
     pub fn configuration(&self) -> Value {
         json!({
             "search": self.config.search,
+            "searchSimdSelected": self.config.search.simd.resolve().ok(),
             "publishMs": self.config.publish.as_millis(),
             "retentionSecs": self.config.retention.as_secs_f64(),
             "maxSessions": self.config.max_sessions,
@@ -980,7 +981,7 @@ impl Actor {
             "moves":self.line.iter().copied().map(move_json).collect::<Vec<_>>(),"position":self.cursor,"toPlay":p.to_move().stone(),"captures":captures,
             "settings":{"komi":self.komi,"rules":"chinese"},"terminal":p.terminal(),"analysis":{"enabled":self.enabled,"status":self.status,"reason":self.reason,"root":root,"candidates":candidates,
                 "visits":ss.root.visits,"nodesPerSecond":self.rate,"graphNodes":ss.nodes,"memoryBytes":ss.memory_bytes,"inFlight":ss.in_flight,
-                "evaluationsCompleted":ss.evaluations_completed,"transpositionHits":ss.transposition_hits,"catchUpVisits":ss.catch_up_visits},"workers":self.pool.views()});
+                "evaluationsCompleted":ss.evaluations_completed,"transpositionHits":ss.transposition_hits,"catchUpVisits":ss.catch_up_visits},"workers":self.pool.snapshot_views()});
         self.snapshots.send_replace(value.clone());
         self.last_publish = Instant::now();
         value

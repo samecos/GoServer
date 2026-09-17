@@ -50,6 +50,8 @@ generation 在切换根或分析任务代次变化时递增，version 单调递�
 
 ## Worker 调度与观测（2026-09-17）
 
+Server 的 CPU 搜索内核可用 `--search-simd auto|scalar|avx512` 选择，默认 `auto`。`/health.configuration.search.simd` 是请求值，`/health.configuration.searchSimdSelected` 是实际选择值。`auto` 在 CPU/OS 支持 AVX-512F 时使用8路 FP64候选评分，否则回退标量；显式选择不受支持的内核会在启动时失败。此开关不改变 Worker/GPU 后端、网络协议、规则或候选排序语义。
+
 `/health.configuration.workerScheduling` 返回实际启动配置。`/api/workers` 和快照中的 Worker 增加以下兼容字段；旧的 EWMA 字段仍保留。所有计数器以连接为边界，重连须按 `connectionId` 分段。
 
 | 字段 | 含义 |
@@ -65,6 +67,7 @@ generation 在切换根或分析任务代次变化时递增，version 单调递�
 
 | metrics 字段 | 计量边界 |
 |---|---|
+| distributionsAgeMs | 本组分布开始读取至返回的年龄（毫秒）；棋局快照共享短期缓存，读取时满100ms便刷新，计算/锁等待可能使返回年龄超过100ms；管理接口每次重新采样 |
 | requestBytesEnqueued | 成功进入 Server 发送通道的评估消息编码字节 |
 | requestBytesStreamed | tonic 已从通道取走的评估消息编码字节；不保证已经上网 |
 | resultBytesReceived / resultMessagesReceived | 当前连接收到的所有评估回包，含重复、退休和错误回包；旧连接忽略 |
@@ -77,6 +80,8 @@ generation 在切换根或分析任务代次变化时递增，version 单调递�
 字节以当前 schema 的外层 Protobuf 编码长度加5字节 gRPC 消息头计算，不含控制消息、HTTP/2、TCP/IP、TLS、ACK、重传；接收侧不计未来 schema 的未知字段。没有启用消息压缩。
 
 每个分布为固定上限2048条最近观测的精确 nearest-rank 分位数：`totalCount` 是连接累计样本数，`windowCount` 是当前窗口样本数，`meanMs/p50Ms/p95Ms/p99Ms/maxMs` 均属于该窗口。空分布为 null，真实零值保留。不能相减不同阶段的 p95，也不能把相邻窗口的分位数差当作阶段增量。没有逐请求同步日志。
+
+棋局快照中的分布（含 `totalCount/windowCount`）允许上述短期延迟；消息/字节计数及 Worker 容量、在途、连接身份仍在每次读取时获取。`/api/workers` 每次返回新采样的分布。每个分布单独采样，整组指标不是同一瞬间的原子快照。分位数排序在调度池锁和样本记录锁之外执行，缓存以连接为边界，重连不复用旧连接的分布。
 
 启动示例：
 

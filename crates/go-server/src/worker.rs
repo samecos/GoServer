@@ -1,5 +1,5 @@
 use crate::{
-    worker_metrics::{Metrics, MetricsView},
+    worker_metrics::{MetricsStore, MetricsView},
     worker_schedule::{CompletionModel, Scheduler, SchedulingConfig},
 };
 use go_core::{EvalToken, EvaluationRequest};
@@ -23,7 +23,7 @@ use uuid::Uuid;
 pub struct Outcome {
     token: EvalToken,
     result: Result<wire::NnOutput, EvalFailure>,
-    observation: Option<(Instant, Arc<Mutex<Metrics>>)>,
+    observation: Option<(Instant, Arc<MetricsStore>)>,
 }
 impl Outcome {
     fn failure(token: EvalToken, reason: &str) -> Self {
@@ -82,7 +82,7 @@ struct Worker {
     tx: mpsc::Sender<Outbound>,
     target_inflight: usize,
     completion: CompletionModel,
-    metrics: Arc<Mutex<Metrics>>,
+    metrics: Arc<MetricsStore>,
     session_inflight: HashMap<String, usize>,
     same_session_dispatches: u64,
     shared_session_dispatches: u64,
@@ -125,7 +125,7 @@ impl Outbound {
             enqueued: Instant::now(),
         }
     }
-    fn into_message(self, metrics: &Mutex<Metrics>) -> Result<wire::ServerMessage, Status> {
+    fn into_message(self, metrics: &MetricsStore) -> Result<wire::ServerMessage, Status> {
         if let Ok(message) = &self.message
             && matches!(
                 message.payload,
@@ -214,46 +214,74 @@ impl WorkerPool {
         !self.inner.lock().unwrap().workers.is_empty()
     }
     pub fn views(&self) -> Vec<WorkerView> {
-        let st = self.inner.lock().unwrap();
-        let mut views: Vec<_> = st
-            .workers
-            .iter()
-            .map(|(id, w)| WorkerView {
-                id: id.clone(),
-                connected: true,
-                connection_id: w.connection.clone(),
-                instance_id: w.hello.instance_id.clone(),
-                model: w.hello.model_sha256.clone(),
-                capacity: w.hello.max_in_flight,
-                target_inflight: w.target_inflight,
-                dispatch_limit: w.dispatch_limit(self.scheduling.scheduler),
-                scheduler: self.scheduling.scheduler,
-                predicted_completion_ms: w.completion.predict_ms(w.in_flight + 1),
-                supplied_throughput_rps: w.completion.throughput_rps,
-                same_session_dispatches: w.same_session_dispatches,
-                shared_session_dispatches: w.shared_session_dispatches,
-                metrics: w.metrics.lock().unwrap().view(),
-                in_flight: w.in_flight,
-                retiring_in_flight: w.retiring,
-                completed: w.completed,
-                assigned_requests: w.assigned_requests,
-                retired_results: w.retired_results,
-                failures: w.failures,
-                latency_ms: w.latency_ms,
-                worker_elapsed_ms: w.worker_elapsed_ms,
-                queue_ms: w.queue_ms,
-                context_ms: w.context_ms,
-                evaluator_ms: w.evaluator_ms,
-                nn_rows: w.heartbeat.nn_rows,
-                nn_batches: w.heartbeat.nn_batches,
-                heartbeat_sequence: w.heartbeat_sequence,
-                heartbeat_in_flight: w.heartbeat.in_flight,
-                heartbeat_age_ms: w.last_heartbeat.map(|t| t.elapsed().as_millis() as u64),
-                backend_info: w.hello.backend_info.clone(),
-                model_version: w.hello.model_version,
-                input_profile: w.hello.input_profile.clone(),
-                engine_commit: w.hello.engine_commit.clone(),
-                supports_shortterm_error: w.hello.supports_shortterm_error,
+        self.views_impl(false)
+    }
+    /// Game snapshots share bounded-age distributions; management reads stay fresh.
+    pub fn snapshot_views(&self) -> Vec<WorkerView> {
+        self.views_impl(true)
+    }
+    fn views_impl(&self, cached: bool) -> Vec<WorkerView> {
+        let snapshots: Vec<_> = {
+            let st = self.inner.lock().unwrap();
+            st.workers
+                .iter()
+                .map(|(id, w)| {
+                    (
+                        WorkerView {
+                            id: id.clone(),
+                            connected: true,
+                            connection_id: w.connection.clone(),
+                            instance_id: w.hello.instance_id.clone(),
+                            model: w.hello.model_sha256.clone(),
+                            capacity: w.hello.max_in_flight,
+                            target_inflight: w.target_inflight,
+                            dispatch_limit: w.dispatch_limit(self.scheduling.scheduler),
+                            scheduler: self.scheduling.scheduler,
+                            predicted_completion_ms: w.completion.predict_ms(w.in_flight + 1),
+                            supplied_throughput_rps: w.completion.throughput_rps,
+                            same_session_dispatches: w.same_session_dispatches,
+                            shared_session_dispatches: w.shared_session_dispatches,
+                            metrics: MetricsView::default(),
+                            in_flight: w.in_flight,
+                            retiring_in_flight: w.retiring,
+                            completed: w.completed,
+                            assigned_requests: w.assigned_requests,
+                            retired_results: w.retired_results,
+                            failures: w.failures,
+                            latency_ms: w.latency_ms,
+                            worker_elapsed_ms: w.worker_elapsed_ms,
+                            queue_ms: w.queue_ms,
+                            context_ms: w.context_ms,
+                            evaluator_ms: w.evaluator_ms,
+                            nn_rows: w.heartbeat.nn_rows,
+                            nn_batches: w.heartbeat.nn_batches,
+                            heartbeat_sequence: w.heartbeat_sequence,
+                            heartbeat_in_flight: w.heartbeat.in_flight,
+                            heartbeat_age_ms: w
+                                .last_heartbeat
+                                .map(|t| t.elapsed().as_millis() as u64),
+                            backend_info: w.hello.backend_info.clone(),
+                            model_version: w.hello.model_version,
+                            input_profile: w.hello.input_profile.clone(),
+                            engine_commit: w.hello.engine_commit.clone(),
+                            supports_shortterm_error: w.hello.supports_shortterm_error,
+                        },
+                        w.metrics.clone(),
+                    )
+                })
+                .collect()
+        };
+        // Neither ring copies nor percentile sorting hold the scheduling lock.
+        // Each captured store belongs to the captured connection, even on reconnect.
+        let mut views: Vec<_> = snapshots
+            .into_iter()
+            .map(|(mut view, metrics)| {
+                view.metrics = if cached {
+                    metrics.snapshot_view()
+                } else {
+                    metrics.view()
+                };
+                view
             })
             .collect();
         views.sort_by(|a, b| a.id.cmp(&b.id));
@@ -319,7 +347,7 @@ impl WorkerPool {
                     .scheduling
                     .target(&hello.worker_id, hello.max_in_flight as usize),
                 completion: CompletionModel::default(),
-                metrics: Arc::new(Mutex::new(Metrics::default())),
+                metrics: Arc::new(MetricsStore::default()),
                 session_inflight: HashMap::new(),
                 same_session_dispatches: 0,
                 shared_session_dispatches: 0,
@@ -740,170 +768,6 @@ impl WorkerPool {
     }
 }
 
-#[cfg(test)]
-mod scheduling_tests {
-    use super::*;
-    use go_core::{Position, Search, SearchStep};
-
-    fn pool(target: usize) -> WorkerPool {
-        WorkerPool::with_scheduling(
-            None,
-            Duration::from_secs(10),
-            SchedulingConfig {
-                scheduler: Scheduler::Completion,
-                target_inflight: Some(target),
-                ..Default::default()
-            },
-        )
-        .unwrap()
-    }
-    fn register(pool: &WorkerPool, id: &str, capacity: u32) -> (String, mpsc::Receiver<Outbound>) {
-        let (tx, rx) = mpsc::channel(128);
-        let connection = pool
-            .register(
-                wire::WorkerHello {
-                    worker_id: id.into(),
-                    instance_id: "fixture".into(),
-                    protocol_version: PROTOCOL_VERSION,
-                    model_sha256: "1".repeat(64),
-                    input_profile: INPUT_PROFILE.into(),
-                    max_in_flight: capacity,
-                    max_board_size: 19,
-                    supports_friendly_pass_search: true,
-                    ..Default::default()
-                },
-                tx,
-            )
-            .unwrap();
-        (connection, rx)
-    }
-    fn request() -> EvaluationRequest {
-        let mut s = Search::new(Position::new(19, 7.5).unwrap(), Default::default()).unwrap();
-        let SearchStep::Evaluate(r) = s.next_evaluation().unwrap() else {
-            panic!()
-        };
-        r
-    }
-    fn reply(message: Outbound) -> wire::WorkerMessage {
-        let wire::server_message::Payload::Evaluate(r) = message.message.unwrap().payload.unwrap()
-        else {
-            panic!()
-        };
-        wire::WorkerMessage {
-            payload: Some(wire::worker_message::Payload::Result(wire::EvalResult {
-                task_id: r.task_id,
-                generation: r.generation,
-                session_id: r.session_id,
-                input_hash: r.input_hash,
-                model_sha256: r.model_sha256,
-                output: Some(Default::default()),
-                context_us: Some(24),
-                evaluator_us: Some(1000),
-                elapsed_us: 1024,
-                ..Default::default()
-            })),
-        }
-    }
-
-    #[test]
-    fn capacity_does_not_bias_startup_and_all_workers_are_probed() {
-        let p = pool(64);
-        let (_, _a) = register(&p, "cpp", 1024);
-        let (_, _b) = register(&p, "rust", 64);
-        let (tx, _rx) = sync_mpsc::channel();
-        let r = request();
-        for _ in 0..8 {
-            assert!(p.dispatch("one", &r, tx.clone()));
-        }
-        assert!(!p.dispatch("one", &r, tx));
-        for w in p.views() {
-            assert_eq!(w.in_flight, 4);
-            assert_eq!(w.target_inflight, 64);
-        }
-    }
-
-    #[test]
-    fn measured_speed_selects_worker_without_capacity_weight() {
-        let p = pool(64);
-        let (_, _a) = register(&p, "slow-big", 1024);
-        let (_, _b) = register(&p, "fast-small", 64);
-        {
-            let mut s = p.inner.lock().unwrap();
-            for (name, ms) in [("slow-big", 80.0), ("fast-small", 20.0)] {
-                let w = s.workers.get_mut(name).unwrap();
-                for _ in 0..4 {
-                    w.completion.observe(64, ms);
-                }
-            }
-        }
-        let (tx, _rx) = sync_mpsc::channel();
-        for _ in 0..64 {
-            assert!(p.dispatch("one", &request(), tx.clone()));
-        }
-        let views = p.views();
-        assert!(views[0].assigned_requests > views[1].assigned_requests * 2);
-    }
-
-    #[test]
-    fn waiting_sessions_get_next_credit_and_cancel_keeps_physical_credit() {
-        let p = pool(1);
-        let (connection, mut rx) = register(&p, "w", 1024);
-        let (tx, mailbox) = sync_mpsc::channel();
-        let r = request();
-        assert!(p.dispatch("a", &r, tx.clone()));
-        let original = reply(rx.try_recv().unwrap());
-        assert!(!p.dispatch("b", &r, tx.clone()));
-        p.cancel_session("a");
-        assert_eq!(p.views()[0].retiring_in_flight, 1);
-        assert!(!p.dispatch("b", &r, tx.clone()));
-        p.receive("w", &connection, original.clone());
-        assert!(mailbox.try_recv().is_err());
-        assert!(!p.dispatch("a", &r, tx.clone()));
-        assert!(p.dispatch("b", &r, tx.clone()));
-        p.receive("w", &connection, original); // Duplicate cannot release b's credit.
-        assert_eq!(p.views()[0].in_flight, 1);
-        assert_eq!(p.views()[0].retired_results, 1);
-        p.cancel_session("a"); // Remove a blocked waiter, even with no assignments.
-        assert!(!p.dispatch("b", &r, tx));
-    }
-
-    #[test]
-    fn bytes_stages_and_old_connection_results_have_explicit_boundaries() {
-        let p = pool(2);
-        let (connection, mut rx) = register(&p, "w", 32);
-        let (tx, mailbox) = sync_mpsc::channel();
-        assert!(p.dispatch("one", &request(), tx));
-        let item = rx.try_recv().unwrap();
-        let expected = item.message.as_ref().unwrap().encode_to_vec().len() as u64 + 5;
-        let metrics = p.inner.lock().unwrap().workers["w"].metrics.clone();
-        let message = item.into_message(&metrics);
-        let result = reply(Outbound::new(message));
-        let result_bytes = result.encode_to_vec().len() as u64 + 5;
-        p.receive("w", "obsolete-connection", result.clone());
-        assert_eq!(p.views()[0].metrics.result_bytes_received, 0);
-        p.receive("w", &connection, result);
-        let v = p.views().remove(0);
-        assert_eq!(v.metrics.request_bytes_enqueued, expected);
-        assert_eq!(v.metrics.request_bytes_streamed, expected);
-        assert_eq!(v.metrics.result_bytes_received, result_bytes);
-        assert_eq!(v.metrics.context.p95_ms, Some(0.024));
-        assert_eq!(v.metrics.worker_queue.p95_ms, None);
-        assert_eq!(v.metrics.actor_wait.total_count, 0);
-        let _ = mailbox.recv().unwrap().into_parts();
-        assert_eq!(p.views()[0].metrics.actor_wait.total_count, 1);
-    }
-
-    #[tokio::test]
-    async fn incoming_sets_nodelay_on_the_accepted_socket() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let mut incoming =
-            tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
-        let _client = tokio::net::TcpStream::connect(address).await.unwrap();
-        assert!(incoming.next().await.unwrap().unwrap().nodelay().unwrap());
-    }
-}
-
 impl Worker {
     fn dispatch_limit(&self, scheduler: Scheduler) -> usize {
         if scheduler == Scheduler::Completion {
@@ -985,3 +849,6 @@ impl WorkerService for WorkerPool {
         )))
     }
 }
+
+#[cfg(test)]
+mod scheduling_tests;
