@@ -62,8 +62,8 @@ curl http://127.0.0.1:8090/api/workers
 | `--http` | `127.0.0.1:8090` | HTTP 和 WebSocket 监听地址 |
 | `--grpc` | `0.0.0.0:50051` | Worker 接入监听地址；上面的启动命令显式限定为本机 |
 | `--model-sha256` | 未指定 | 固定外部 Worker 使用的模型文件 SHA-256 |
-| `--graph-memory-mib` | `512` | 每会话搜索图的逻辑内存预算，非进程 RSS 限额 |
-| `--max-nodes` | `100000` | 每会话搜索图节点上限 |
+| `--graph-memory-mib` | `32768` | 每会话搜索图的逻辑内存预算（32 GiB），按需增长，非进程 RSS 限额 |
+| `--max-nodes` | `1000000` | 每会话搜索图节点上限，与内存预算分别生效 |
 | `--max-in-flight` | `128` | 每会话在途搜索路径上限 |
 | `--max-sessions` | `4` | 会话数量上限 |
 | `--session-retention-secs` | `120` | 无订阅者时的会话保留时间 |
@@ -71,6 +71,8 @@ curl http://127.0.0.1:8090/api/workers
 | `--lease-ms` | `20000` | 评估任务租约 |
 | `--gtp` | 关闭 | 启用标准输入/输出 GTP，日志写入 stderr |
 | `--gtp-tcp` | 不监听 | 启用指定地址上的 TCP GTP |
+
+32 GiB 是每个会话独立的搜索图预算，不会在启动时预分配，也不是整个 Server 的共享池或 RSS 硬上限；多个保留会话的预算可以累加。内存或节点上限达到后，搜索会保留结果并报告 `memory_limited`；默认节点上限提高到100万，避免将内存调大后仍被旧10万节点上限提前截断。可以显式传入较小预算，例如 `--graph-memory-mib 512 --max-nodes 100000`。实际生效值见 `/health.configuration.search`，修改启动参数需要重启 Server。
 
 未指定 `--model-sha256` 时，第一个通过握手校验的 Worker 固定该服务进程的模型哈希；Worker 离线不会清除它。更换模型需要重启服务，已有会话不会跨服务重启保存。
 

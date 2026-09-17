@@ -20,9 +20,11 @@ struct Args {
     grpc: SocketAddr,
     #[arg(long)]
     model_sha256: Option<String>,
-    #[arg(long, default_value_t = 512)]
+    /// Per-session logical graph budget in MiB, allocated as the search grows.
+    #[arg(long, default_value_t = go_core::SearchConfig::default().max_memory_bytes / (1024 * 1024))]
     graph_memory_mib: usize,
-    #[arg(long, default_value_t = 100000)]
+    /// Per-session node ceiling, independent of the graph memory budget.
+    #[arg(long, default_value_t = go_core::SearchConfig::default().max_nodes)]
     max_nodes: usize,
     #[arg(long, default_value_t = 128)]
     max_in_flight: usize,

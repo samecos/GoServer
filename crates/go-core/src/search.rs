@@ -406,8 +406,8 @@ impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             simd: SearchSimd::Auto,
-            max_nodes: 100_000,
-            max_memory_bytes: 512 * 1024 * 1024,
+            max_nodes: 1_000_000,
+            max_memory_bytes: 32 * 1024 * 1024 * 1024,
             max_in_flight: 128,
             max_depth: 1000,
             selection_work_budget: 4096,
