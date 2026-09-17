@@ -851,4 +851,5 @@ impl WorkerService for WorkerPool {
 }
 
 #[cfg(test)]
+#[path = "worker_scheduling_tests.rs"]
 mod scheduling_tests;
