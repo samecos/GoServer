@@ -12,6 +12,7 @@ use go_server::{
     app::App,
     session::{SessionConfig, Sessions},
     worker::WorkerPool,
+    worker_schedule::{Scheduler, SchedulingConfig},
 };
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -41,7 +42,14 @@ impl Harness {
         Self::configured_with_lease(config, Duration::from_millis(150)).await
     }
     async fn configured_with_lease(config: SessionConfig, lease: Duration) -> Self {
-        let pool = WorkerPool::new(Some(MODEL.into()), lease);
+        Self::scheduled(config, lease, SchedulingConfig::default()).await
+    }
+    async fn scheduled(
+        config: SessionConfig,
+        lease: Duration,
+        scheduling: SchedulingConfig,
+    ) -> Self {
+        let pool = WorkerPool::with_scheduling(Some(MODEL.into()), lease, scheduling).unwrap();
         let sessions = Sessions::new(config, pool.clone());
         let hl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let http = format!("ws://{}/ws", hl.local_addr().unwrap());
@@ -114,6 +122,66 @@ impl Harness {
             Some(w::server_message::Payload::Welcome(_))
         ));
         (tx, stream)
+    }
+}
+
+#[tokio::test]
+async fn completion_scheduler_serves_two_sessions_with_different_hard_capacities() {
+    let h = Harness::scheduled(
+        SessionConfig {
+            publish: Duration::from_millis(20),
+            ..Default::default()
+        },
+        Duration::from_secs(2),
+        SchedulingConfig {
+            scheduler: Scheduler::Completion,
+            target_inflight: Some(2),
+            ..Default::default()
+        },
+    )
+    .await;
+    let mut bots = vec![];
+    for (id, capacity, delay) in [("large", 1024, 4), ("small", 64, 2)] {
+        let mut identity = hello(id);
+        identity.max_in_flight = capacity;
+        let (tx, mut incoming) = h.worker_with_hello(identity).await;
+        bots.push(tokio::spawn(async move {
+            while let Ok(Some(msg)) = incoming.message().await {
+                if let Some(w::server_message::Payload::Evaluate(r)) = msg.payload {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    if tx.send(result(r)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }));
+    }
+    let (mut a, _) = connect_async(&h.http).await.unwrap();
+    let (mut b, _) = connect_async(&h.http).await.unwrap();
+    request(&mut a, json!({"id":"open-a","type":"open"})).await;
+    request(&mut b, json!({"id":"open-b","type":"open"})).await;
+    let (a_result, b_result) = tokio::join!(
+        request(
+            &mut a,
+            json!({"id":"a","type":"genmove","maxVisits":32,"maxTimeMs":2000})
+        ),
+        request(
+            &mut b,
+            json!({"id":"b","type":"genmove","maxVisits":32,"maxTimeMs":2000})
+        ),
+    );
+    assert_eq!(a_result["ok"], true, "{a_result}");
+    assert_eq!(b_result["ok"], true, "{b_result}");
+    for w in h.pool.views() {
+        assert_eq!(w.target_inflight, 2);
+        assert!(w.in_flight <= 2);
+        assert!(w.completed > 0);
+        assert!(w.metrics.actor_wait.total_count > 0);
+        assert!(w.metrics.send_queue.total_count > 0);
+        assert!(w.shared_session_dispatches > 0);
+    }
+    for bot in bots {
+        bot.abort();
     }
 }
 impl Drop for Harness {

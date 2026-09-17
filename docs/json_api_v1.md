@@ -47,3 +47,43 @@
 generation 在切换根或分析任务代次变化时递增，version 单调递增。前端丢弃较旧 generation/version 的快照。快照默认约300ms合并发布；命令响应、停止和错误及时发送。短暂断线暂停无人订阅的搜索，服务保留会话供恢复；首版悬停不会新建推理任务。
 
 兼容 Worker 未连接时，analyze 可进入 waiting_workers；genmove 无法取得有效评估时明确失败，不静默随机落子。错误码会区分 INVALID_REQUEST、ILLEGAL_MOVE、UNSUPPORTED、STALE_GENERATION、CANCELLED、NO_WORKERS、CAPACITY 和 SESSION_NOT_FOUND。
+
+## Worker 调度与观测（2026-09-17）
+
+`/health.configuration.workerScheduling` 返回实际启动配置。`/api/workers` 和快照中的 Worker 增加以下兼容字段；旧的 EWMA 字段仍保留。所有计数器以连接为边界，重连须按 `connectionId` 分段。
+
+| 字段 | 含义 |
+|---|---|
+| capacity | Hello 声明的硬接纳容量，取消中的请求也占用 |
+| targetInFlight | Server 为该 Worker 配置并裁剪到硬容量的目标窗口 |
+| dispatchLimit | 当前派发上限；completion 启动探测期间最多4，获得4个成功样本后使用目标窗口 |
+| scheduler | legacy 或 completion；默认 legacy，新模式须显式启用 |
+| predictedCompletionMs | 按派发时在途数量分档的实测 RPC EWMA 估计；启动时为探测先验，不是保证 |
+| suppliedThroughputRps | 最近至少1秒区间内的有效回包率；区间至少80%时间达到目标窗口的75%才报告，否则 null；包含缓存命中，不等于 NN rows/s |
+| sameSessionDispatches / sharedSessionDispatches | 派发时该 Worker 没有其他会话在途 / 存在其他会话在途的累计次数；两者之和等于 assignedRequests |
+| metrics | 消息字节与阶段分布，见下表 |
+
+| metrics 字段 | 计量边界 |
+|---|---|
+| requestBytesEnqueued | 成功进入 Server 发送通道的评估消息编码字节 |
+| requestBytesStreamed | tonic 已从通道取走的评估消息编码字节；不保证已经上网 |
+| resultBytesReceived / resultMessagesReceived | 当前连接收到的所有评估回包，含重复、退休和错误回包；旧连接忽略 |
+| rpc | 身份匹配的唯一终态回包：成功入发送通道前到 Server 收到解码结果；包含退休和错误 |
+| retiredRpc | 上述 rpc 中已取消、不再应用到搜索图的回包子集 |
+| workerElapsed / workerQueue / context / evaluator | Worker 自报的阶段持续时间；可选阶段未执行/缺失时不补零 |
+| sendQueue | Server 入队到 tonic 拉取响应流，不含 tonic 后续编码、HTTP/2 流控或网络 |
+| actorWait | 有效任务结果进入 actor 邮箱到 actor 取出，不含更新搜索图的 CPU 时间；取消后尚在邮箱的旧代次结果也可能被取出 |
+
+字节以当前 schema 的外层 Protobuf 编码长度加5字节 gRPC 消息头计算，不含控制消息、HTTP/2、TCP/IP、TLS、ACK、重传；接收侧不计未来 schema 的未知字段。没有启用消息压缩。
+
+每个分布为固定上限2048条最近观测的精确 nearest-rank 分位数：`totalCount` 是连接累计样本数，`windowCount` 是当前窗口样本数，`meanMs/p50Ms/p95Ms/p99Ms/maxMs` 均属于该窗口。空分布为 null，真实零值保留。不能相减不同阶段的 p95，也不能把相邻窗口的分位数差当作阶段增量。没有逐请求同步日志。
+
+启动示例：
+
+```text
+go-server --worker-scheduler completion --worker-target-inflight 64 --worker-target worker-a=32 --worker-target worker-b=64
+```
+
+`--worker-target` 可重复指定不同 Worker。各目标必须为1..4096，实际裁剪到 Worker 硬容量。legacy 未设置目标时保持旧容量；completion 未设置目标时使用 min(64, capacity)。completion 的评分不除以 capacity，使用在途分档的 RPC 完成时间估计，并对等待派发的会话轮转；失活等待者20ms到期，取消立即移除。此版目标窗口是显式配置值，尚未自动扩缩窗、感知任务 deadline 或做跨会话 NN 去重。物理信用仍仅在终态回包或连接回收后释放。
+
+协议 v1 心跳只有 NN rows/batches 总数，不能据此恢复逐批分布、单任务缓存命中或精确的取消尾部 NN rows。分阶段实验应在前后物理排空并取得新心跳后统计总量；这些缺失指标不能用估算值冒充。

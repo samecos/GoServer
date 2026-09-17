@@ -225,6 +225,7 @@ impl Sessions {
             "retentionSecs": self.config.retention.as_secs_f64(),
             "maxSessions": self.config.max_sessions,
             "maxMoves": self.config.max_moves,
+            "workerScheduling": self.pool.scheduling(),
         })
     }
 }
@@ -424,7 +425,8 @@ impl Actor {
             }
         }
     }
-    fn complete_evaluation(&mut self, (token, result): Outcome) {
+    fn complete_evaluation(&mut self, outcome: Outcome) {
+        let (token, result) = outcome.into_parts();
         match result {
             Ok(v) => {
                 let evaluation = Evaluation {

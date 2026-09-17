@@ -9,6 +9,7 @@ go-core = { path = "../go-core" }
 go-protocol = { path = "../go-protocol" }
 tokio.workspace = true
 tonic.workspace = true
+prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

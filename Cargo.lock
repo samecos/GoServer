@@ -429,6 +429,7 @@ dependencies = [
  "futures-util",
  "go-core",
  "go-protocol",
+ "prost",
  "serde",
  "serde_json",
  "tokio",

@@ -1,21 +1,49 @@
+use crate::{
+    worker_metrics::{Metrics, MetricsView},
+    worker_schedule::{CompletionModel, Scheduler, SchedulingConfig},
+};
 use go_core::{EvalToken, EvaluationRequest};
 use go_protocol::{
     INPUT_PROFILE, PROTOCOL_VERSION,
     v1::{self as wire, worker_service_server::WorkerService},
 };
+use prost::Message;
 use serde::Serialize;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     pin::Pin,
     sync::{Arc, Mutex, mpsc as sync_mpsc},
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
-use tokio_stream::{Stream, wrappers::ReceiverStream};
+use tokio_stream::{Stream, StreamExt, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, Streaming};
 use uuid::Uuid;
 
-pub type Outcome = (EvalToken, Result<wire::NnOutput, EvalFailure>);
+pub struct Outcome {
+    token: EvalToken,
+    result: Result<wire::NnOutput, EvalFailure>,
+    observation: Option<(Instant, Arc<Mutex<Metrics>>)>,
+}
+impl Outcome {
+    fn failure(token: EvalToken, reason: &str) -> Self {
+        Self {
+            token,
+            result: Err(EvalFailure::retry(reason)),
+            observation: None,
+        }
+    }
+    pub fn into_parts(self) -> (EvalToken, Result<wire::NnOutput, EvalFailure>) {
+        if let Some((received, metrics)) = self.observation {
+            metrics
+                .lock()
+                .unwrap()
+                .actor_wait
+                .record(received.elapsed().as_secs_f64() * 1000.0);
+        }
+        (self.token, self.result)
+    }
+}
 #[derive(Debug)]
 pub struct EvalFailure {
     pub code: String,
@@ -36,6 +64,7 @@ impl EvalFailure {
 pub struct WorkerPool {
     inner: Arc<Mutex<PoolState>>,
     lease: Duration,
+    scheduling: SchedulingConfig,
 }
 struct PoolState {
     workers: HashMap<String, Worker>,
@@ -43,11 +72,20 @@ struct PoolState {
     next_id: u64,
     model: Option<String>,
     cooldowns: HashMap<String, Instant>,
+    // Only sessions currently blocked on dispatch are queued. Idle/cancelled
+    // sessions cannot retain a turn indefinitely.
+    waiters: VecDeque<(String, Instant)>,
 }
 struct Worker {
     hello: wire::WorkerHello,
     connection: String,
-    tx: mpsc::Sender<Result<wire::ServerMessage, Status>>,
+    tx: mpsc::Sender<Outbound>,
+    target_inflight: usize,
+    completion: CompletionModel,
+    metrics: Arc<Mutex<Metrics>>,
+    session_inflight: HashMap<String, usize>,
+    same_session_dispatches: u64,
+    shared_session_dispatches: u64,
     last_seen: Instant,
     in_flight: usize,
     retiring: usize,
@@ -72,8 +110,35 @@ struct Pending {
     token: EvalToken,
     hash: Vec<u8>,
     sent: Instant,
+    occupancy: usize,
     reply: Option<sync_mpsc::Sender<Outcome>>,
     cancelled: Option<Instant>,
+}
+struct Outbound {
+    message: Result<wire::ServerMessage, Status>,
+    enqueued: Instant,
+}
+impl Outbound {
+    fn new(message: Result<wire::ServerMessage, Status>) -> Self {
+        Self {
+            message,
+            enqueued: Instant::now(),
+        }
+    }
+    fn into_message(self, metrics: &Mutex<Metrics>) -> Result<wire::ServerMessage, Status> {
+        if let Ok(message) = &self.message
+            && matches!(
+                message.payload,
+                Some(wire::server_message::Payload::Evaluate(_))
+            )
+        {
+            let mut m = metrics.lock().unwrap();
+            m.request_bytes_streamed += message.encoded_len() as u64 + 5;
+            m.send_queue
+                .record(self.enqueued.elapsed().as_secs_f64() * 1000.0);
+        }
+        self.message
+    }
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -84,6 +149,15 @@ pub struct WorkerView {
     pub instance_id: String,
     pub model: String,
     pub capacity: u32,
+    #[serde(rename = "targetInFlight")]
+    pub target_inflight: usize,
+    pub dispatch_limit: usize,
+    pub scheduler: Scheduler,
+    pub predicted_completion_ms: f64,
+    pub supplied_throughput_rps: Option<f64>,
+    pub same_session_dispatches: u64,
+    pub shared_session_dispatches: u64,
+    pub metrics: MetricsView,
     pub in_flight: usize,
     pub retiring_in_flight: usize,
     pub completed: u64,
@@ -109,16 +183,29 @@ pub struct WorkerView {
 
 impl WorkerPool {
     pub fn new(model: Option<String>, lease: Duration) -> Self {
-        Self {
+        Self::with_scheduling(model, lease, SchedulingConfig::default()).unwrap()
+    }
+    pub fn with_scheduling(
+        model: Option<String>,
+        lease: Duration,
+        scheduling: SchedulingConfig,
+    ) -> Result<Self, &'static str> {
+        scheduling.validate()?;
+        Ok(Self {
             inner: Arc::new(Mutex::new(PoolState {
                 workers: HashMap::new(),
                 pending: HashMap::new(),
                 next_id: 1,
                 model,
                 cooldowns: HashMap::new(),
+                waiters: VecDeque::new(),
             })),
             lease,
-        }
+            scheduling,
+        })
+    }
+    pub fn scheduling(&self) -> &SchedulingConfig {
+        &self.scheduling
     }
     pub fn model(&self) -> Option<String> {
         self.inner.lock().unwrap().model.clone()
@@ -138,6 +225,14 @@ impl WorkerPool {
                 instance_id: w.hello.instance_id.clone(),
                 model: w.hello.model_sha256.clone(),
                 capacity: w.hello.max_in_flight,
+                target_inflight: w.target_inflight,
+                dispatch_limit: w.dispatch_limit(self.scheduling.scheduler),
+                scheduler: self.scheduling.scheduler,
+                predicted_completion_ms: w.completion.predict_ms(w.in_flight + 1),
+                supplied_throughput_rps: w.completion.throughput_rps,
+                same_session_dispatches: w.same_session_dispatches,
+                shared_session_dispatches: w.shared_session_dispatches,
+                metrics: w.metrics.lock().unwrap().view(),
                 in_flight: w.in_flight,
                 retiring_in_flight: w.retiring,
                 completed: w.completed,
@@ -167,7 +262,7 @@ impl WorkerPool {
     fn register(
         &self,
         hello: wire::WorkerHello,
-        tx: mpsc::Sender<Result<wire::ServerMessage, Status>>,
+        tx: mpsc::Sender<Outbound>,
     ) -> Result<String, Status> {
         if hello.protocol_version != PROTOCOL_VERSION
             || hello.input_profile != INPUT_PROFILE
@@ -220,6 +315,14 @@ impl WorkerPool {
         st.workers.insert(
             hello.worker_id.clone(),
             Worker {
+                target_inflight: self
+                    .scheduling
+                    .target(&hello.worker_id, hello.max_in_flight as usize),
+                completion: CompletionModel::default(),
+                metrics: Arc::new(Mutex::new(Metrics::default())),
+                session_inflight: HashMap::new(),
+                same_session_dispatches: 0,
+                shared_session_dispatches: 0,
                 hello,
                 connection: connection.clone(),
                 tx,
@@ -252,16 +355,32 @@ impl WorkerPool {
         reply: sync_mpsc::Sender<Outcome>,
     ) -> bool {
         let mut st = self.inner.lock().unwrap();
+        if self.scheduling.scheduler == Scheduler::Completion {
+            let now = Instant::now();
+            st.waiters
+                .retain(|(_, t)| now.duration_since(*t) < Duration::from_millis(20));
+            if let Some((_, t)) = st.waiters.iter_mut().find(|(s, _)| s == session) {
+                *t = now;
+            } else {
+                st.waiters.push_back((session.into(), now));
+            }
+            if st.waiters.front().is_some_and(|(s, _)| s != session) {
+                return false;
+            }
+        }
         let Some(id) = st
             .workers
             .iter()
-            .filter(|(_, w)| w.in_flight < (w.hello.max_in_flight as usize) && !w.tx.is_closed())
-            .min_by(|(_, a), (_, b)| {
-                let a_load = (a.in_flight as f64 + 1.0) / (a.hello.max_in_flight as f64)
-                    * a.latency_ms.max(1.0);
-                let b_load = (b.in_flight as f64 + 1.0) / (b.hello.max_in_flight as f64)
-                    * b.latency_ms.max(1.0);
-                a_load.total_cmp(&b_load)
+            .filter(|(_, w)| {
+                w.in_flight < w.dispatch_limit(self.scheduling.scheduler)
+                    && !w.tx.is_closed()
+                    && w.tx.capacity() > 0
+            })
+            .min_by(|(aid, a), (bid, b)| {
+                a.score(self.scheduling.scheduler)
+                    .total_cmp(&b.score(self.scheduling.scheduler))
+                    .then(a.assigned_requests.cmp(&b.assigned_requests))
+                    .then(aid.cmp(bid))
             })
             .map(|(id, _)| id.clone())
         else {
@@ -313,17 +432,30 @@ impl WorkerPool {
             lease_ms: self.lease.as_millis() as u64,
         };
         let w = st.workers.get_mut(&id).unwrap();
-        if w.tx
-            .try_send(Ok(wire::ServerMessage {
-                payload: Some(wire::server_message::Payload::Evaluate(msg)),
-            }))
-            .is_err()
-        {
+        let message = wire::ServerMessage {
+            payload: Some(wire::server_message::Payload::Evaluate(msg)),
+        };
+        let bytes = message.encoded_len() as u64 + 5;
+        let sent = Instant::now();
+        if w.tx.try_send(Outbound::new(Ok(message))).is_err() {
             return false;
         }
+        w.metrics.lock().unwrap().request_bytes_enqueued += bytes;
+        w.completion
+            .traffic(sent, w.in_flight, w.target_inflight, false);
+        if w.session_inflight.keys().any(|s| s != session) {
+            w.shared_session_dispatches += 1;
+        } else {
+            w.same_session_dispatches += 1;
+        }
+        *w.session_inflight.entry(session.into()).or_default() += 1;
         w.in_flight += 1;
         w.assigned_requests += 1;
         let connection = w.connection.clone();
+        let occupancy = w.in_flight;
+        if self.scheduling.scheduler == Scheduler::Completion {
+            st.waiters.pop_front();
+        }
         st.pending.insert(
             task_id,
             Pending {
@@ -332,7 +464,8 @@ impl WorkerPool {
                 connection,
                 token: request.token,
                 hash: request.input_hash.to_vec(),
-                sent: Instant::now(),
+                sent,
+                occupancy,
                 reply: Some(reply),
                 cancelled: None,
             },
@@ -340,6 +473,8 @@ impl WorkerPool {
         true
     }
     fn receive(&self, id: &str, connection: &str, msg: wire::WorkerMessage) {
+        let received = Instant::now();
+        let bytes = msg.encoded_len() as u64 + 5;
         let mut st = self.inner.lock().unwrap();
         let Some(w) = st
             .workers
@@ -349,6 +484,11 @@ impl WorkerPool {
             return;
         };
         w.last_seen = Instant::now();
+        if matches!(msg.payload, Some(wire::worker_message::Payload::Result(_))) {
+            let mut m = w.metrics.lock().unwrap();
+            m.result_bytes_received += bytes;
+            m.result_messages_received += 1;
+        }
         match msg.payload {
             Some(wire::worker_message::Payload::Heartbeat(heartbeat)) => {
                 w.heartbeat = heartbeat;
@@ -372,12 +512,40 @@ impl WorkerPool {
                 }
                 let p = st.pending.remove(&result.task_id).unwrap();
                 let w = st.workers.get_mut(id).unwrap();
+                let ms = received.duration_since(p.sent).as_secs_f64() * 1000.0;
+                w.completion.traffic(
+                    received,
+                    w.in_flight,
+                    w.target_inflight,
+                    p.reply.is_some() && result.error_code.is_empty() && result.output.is_some(),
+                );
+                if let Some(n) = w.session_inflight.get_mut(&p.session) {
+                    *n -= 1;
+                    if *n == 0 {
+                        w.session_inflight.remove(&p.session);
+                    }
+                }
                 w.in_flight = w.in_flight.saturating_sub(1);
+                {
+                    let mut m = w.metrics.lock().unwrap();
+                    m.rpc.record(ms);
+                    m.worker_elapsed.record(result.elapsed_us as f64 / 1000.0);
+                    if let Some(us) = result.queue_us {
+                        m.worker_queue.record(us as f64 / 1000.0);
+                    }
+                    if let Some(us) = result.context_us {
+                        m.context.record(us as f64 / 1000.0);
+                    }
+                    if let Some(us) = result.evaluator_us {
+                        m.evaluator.record(us as f64 / 1000.0);
+                    }
+                }
                 // A cancelled lease no longer owns a graph node, but retains physical
                 // Worker capacity until its result/ack arrives. Never apply its value.
                 let Some(reply) = p.reply else {
                     w.retiring = w.retiring.saturating_sub(1);
                     w.retired_results += 1;
+                    w.metrics.lock().unwrap().retired_rpc.record(ms);
                     return;
                 };
                 if result.error_code.is_empty()
@@ -389,7 +557,6 @@ impl WorkerPool {
                     result.error_message =
                         "short-term error capability does not match WorkerHello".into();
                 }
-                let ms = p.sent.elapsed().as_secs_f64() * 1000.0;
                 w.latency_ms = if w.latency_ms == 0.0 {
                     ms
                 } else {
@@ -415,6 +582,7 @@ impl WorkerPool {
                         message: result.error_message,
                     })
                 } else if let Some(output) = result.output {
+                    w.completion.observe(p.occupancy, ms);
                     w.worker_elapsed_ms = ewma(w.worker_elapsed_ms, Some(result.elapsed_us));
                     w.queue_ms = ewma(w.queue_ms, result.queue_us);
                     w.context_ms = ewma(w.context_ms, result.context_us);
@@ -428,6 +596,7 @@ impl WorkerPool {
                     trip_circuit = w.consecutive_failures >= 3;
                     Err(EvalFailure::retry("empty evaluator result"))
                 };
+                let observation = Some((Instant::now(), w.metrics.clone()));
                 if trip_circuit {
                     st.cooldowns
                         .insert(id.into(), Instant::now() + Duration::from_secs(10));
@@ -439,7 +608,11 @@ impl WorkerPool {
                         "worker repeatedly failed evaluations",
                     );
                 }
-                let _ = reply.send((p.token, result));
+                let _ = reply.send(Outcome {
+                    token: p.token,
+                    result,
+                    observation,
+                });
             }
             _ => Self::remove_worker(&mut st, id, connection, "unexpected worker message"),
         }
@@ -453,7 +626,8 @@ impl WorkerPool {
             return;
         }
         if let Some(w) = st.workers.remove(id) {
-            let _ = w.tx.try_send(Err(Status::unavailable(reason.to_owned())));
+            let _ =
+                w.tx.try_send(Outbound::new(Err(Status::unavailable(reason.to_owned()))));
         }
         let tasks: Vec<_> = st
             .pending
@@ -465,7 +639,7 @@ impl WorkerPool {
             if let Some(p) = st.pending.remove(&task)
                 && let Some(reply) = p.reply
             {
-                let _ = reply.send((p.token, Err(EvalFailure::retry(reason))));
+                let _ = reply.send(Outcome::failure(p.token, reason));
             }
         }
     }
@@ -474,6 +648,7 @@ impl WorkerPool {
     }
     pub fn cancel_session(&self, session: &str) {
         let mut st = self.inner.lock().unwrap();
+        st.waiters.retain(|(s, _)| s != session);
         let keys: Vec<_> = st
             .pending
             .iter()
@@ -493,7 +668,7 @@ impl WorkerPool {
         };
         p.cancelled = Some(Instant::now());
         if let Some(reason) = error {
-            let _ = reply.send((p.token, Err(EvalFailure::retry(reason))));
+            let _ = reply.send(Outcome::failure(p.token, reason));
         }
         if let Some(w) = st
             .workers
@@ -504,17 +679,21 @@ impl WorkerPool {
             if error.is_some() {
                 w.failures += 1;
             }
-            let _ = w.tx.try_send(Ok(wire::ServerMessage {
+            let _ = w.tx.try_send(Outbound::new(Ok(wire::ServerMessage {
                 payload: Some(wire::server_message::Payload::Cancel(wire::Cancel {
                     task_id: task,
                     generation: p.token.generation,
                     session_id: p.session.clone(),
                 })),
-            }));
+            })));
         }
     }
     pub fn maintenance(&self) {
         let mut st = self.inner.lock().unwrap();
+        for w in st.workers.values_mut() {
+            w.completion
+                .traffic(Instant::now(), w.in_flight, w.target_inflight, false);
+        }
         st.cooldowns.retain(|_, until| *until > Instant::now());
         let dead: Vec<_> = st
             .workers
@@ -561,6 +740,189 @@ impl WorkerPool {
     }
 }
 
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+    use go_core::{Position, Search, SearchStep};
+
+    fn pool(target: usize) -> WorkerPool {
+        WorkerPool::with_scheduling(
+            None,
+            Duration::from_secs(10),
+            SchedulingConfig {
+                scheduler: Scheduler::Completion,
+                target_inflight: Some(target),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+    }
+    fn register(pool: &WorkerPool, id: &str, capacity: u32) -> (String, mpsc::Receiver<Outbound>) {
+        let (tx, rx) = mpsc::channel(128);
+        let connection = pool
+            .register(
+                wire::WorkerHello {
+                    worker_id: id.into(),
+                    instance_id: "fixture".into(),
+                    protocol_version: PROTOCOL_VERSION,
+                    model_sha256: "1".repeat(64),
+                    input_profile: INPUT_PROFILE.into(),
+                    max_in_flight: capacity,
+                    max_board_size: 19,
+                    supports_friendly_pass_search: true,
+                    ..Default::default()
+                },
+                tx,
+            )
+            .unwrap();
+        (connection, rx)
+    }
+    fn request() -> EvaluationRequest {
+        let mut s = Search::new(Position::new(19, 7.5).unwrap(), Default::default()).unwrap();
+        let SearchStep::Evaluate(r) = s.next_evaluation().unwrap() else {
+            panic!()
+        };
+        r
+    }
+    fn reply(message: Outbound) -> wire::WorkerMessage {
+        let wire::server_message::Payload::Evaluate(r) = message.message.unwrap().payload.unwrap()
+        else {
+            panic!()
+        };
+        wire::WorkerMessage {
+            payload: Some(wire::worker_message::Payload::Result(wire::EvalResult {
+                task_id: r.task_id,
+                generation: r.generation,
+                session_id: r.session_id,
+                input_hash: r.input_hash,
+                model_sha256: r.model_sha256,
+                output: Some(Default::default()),
+                context_us: Some(24),
+                evaluator_us: Some(1000),
+                elapsed_us: 1024,
+                ..Default::default()
+            })),
+        }
+    }
+
+    #[test]
+    fn capacity_does_not_bias_startup_and_all_workers_are_probed() {
+        let p = pool(64);
+        let (_, _a) = register(&p, "cpp", 1024);
+        let (_, _b) = register(&p, "rust", 64);
+        let (tx, _rx) = sync_mpsc::channel();
+        let r = request();
+        for _ in 0..8 {
+            assert!(p.dispatch("one", &r, tx.clone()));
+        }
+        assert!(!p.dispatch("one", &r, tx));
+        for w in p.views() {
+            assert_eq!(w.in_flight, 4);
+            assert_eq!(w.target_inflight, 64);
+        }
+    }
+
+    #[test]
+    fn measured_speed_selects_worker_without_capacity_weight() {
+        let p = pool(64);
+        let (_, _a) = register(&p, "slow-big", 1024);
+        let (_, _b) = register(&p, "fast-small", 64);
+        {
+            let mut s = p.inner.lock().unwrap();
+            for (name, ms) in [("slow-big", 80.0), ("fast-small", 20.0)] {
+                let w = s.workers.get_mut(name).unwrap();
+                for _ in 0..4 {
+                    w.completion.observe(64, ms);
+                }
+            }
+        }
+        let (tx, _rx) = sync_mpsc::channel();
+        for _ in 0..64 {
+            assert!(p.dispatch("one", &request(), tx.clone()));
+        }
+        let views = p.views();
+        assert!(views[0].assigned_requests > views[1].assigned_requests * 2);
+    }
+
+    #[test]
+    fn waiting_sessions_get_next_credit_and_cancel_keeps_physical_credit() {
+        let p = pool(1);
+        let (connection, mut rx) = register(&p, "w", 1024);
+        let (tx, mailbox) = sync_mpsc::channel();
+        let r = request();
+        assert!(p.dispatch("a", &r, tx.clone()));
+        let original = reply(rx.try_recv().unwrap());
+        assert!(!p.dispatch("b", &r, tx.clone()));
+        p.cancel_session("a");
+        assert_eq!(p.views()[0].retiring_in_flight, 1);
+        assert!(!p.dispatch("b", &r, tx.clone()));
+        p.receive("w", &connection, original.clone());
+        assert!(mailbox.try_recv().is_err());
+        assert!(!p.dispatch("a", &r, tx.clone()));
+        assert!(p.dispatch("b", &r, tx.clone()));
+        p.receive("w", &connection, original); // Duplicate cannot release b's credit.
+        assert_eq!(p.views()[0].in_flight, 1);
+        assert_eq!(p.views()[0].retired_results, 1);
+        p.cancel_session("a"); // Remove a blocked waiter, even with no assignments.
+        assert!(!p.dispatch("b", &r, tx));
+    }
+
+    #[test]
+    fn bytes_stages_and_old_connection_results_have_explicit_boundaries() {
+        let p = pool(2);
+        let (connection, mut rx) = register(&p, "w", 32);
+        let (tx, mailbox) = sync_mpsc::channel();
+        assert!(p.dispatch("one", &request(), tx));
+        let item = rx.try_recv().unwrap();
+        let expected = item.message.as_ref().unwrap().encode_to_vec().len() as u64 + 5;
+        let metrics = p.inner.lock().unwrap().workers["w"].metrics.clone();
+        let message = item.into_message(&metrics);
+        let result = reply(Outbound::new(message));
+        let result_bytes = result.encode_to_vec().len() as u64 + 5;
+        p.receive("w", "obsolete-connection", result.clone());
+        assert_eq!(p.views()[0].metrics.result_bytes_received, 0);
+        p.receive("w", &connection, result);
+        let v = p.views().remove(0);
+        assert_eq!(v.metrics.request_bytes_enqueued, expected);
+        assert_eq!(v.metrics.request_bytes_streamed, expected);
+        assert_eq!(v.metrics.result_bytes_received, result_bytes);
+        assert_eq!(v.metrics.context.p95_ms, Some(0.024));
+        assert_eq!(v.metrics.worker_queue.p95_ms, None);
+        assert_eq!(v.metrics.actor_wait.total_count, 0);
+        let _ = mailbox.recv().unwrap().into_parts();
+        assert_eq!(p.views()[0].metrics.actor_wait.total_count, 1);
+    }
+
+    #[tokio::test]
+    async fn incoming_sets_nodelay_on_the_accepted_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut incoming =
+            tonic::transport::server::TcpIncoming::from(listener).with_nodelay(Some(true));
+        let _client = tokio::net::TcpStream::connect(address).await.unwrap();
+        assert!(incoming.next().await.unwrap().unwrap().nodelay().unwrap());
+    }
+}
+
+impl Worker {
+    fn dispatch_limit(&self, scheduler: Scheduler) -> usize {
+        if scheduler == Scheduler::Completion {
+            self.completion.limit(self.target_inflight)
+        } else {
+            self.target_inflight
+        }
+    }
+    fn score(&self, scheduler: Scheduler) -> f64 {
+        match scheduler {
+            Scheduler::Legacy => {
+                (self.in_flight as f64 + 1.0) / self.hello.max_in_flight as f64
+                    * self.latency_ms.max(1.0)
+            }
+            Scheduler::Completion => self.completion.predict_ms(self.in_flight + 1),
+        }
+    }
+}
+
 fn ewma(previous: Option<f64>, micros: Option<u64>) -> Option<f64> {
     micros
         .map(|us| {
@@ -594,12 +956,13 @@ impl WorkerService for WorkerPool {
         let id = hello.worker_id.clone();
         let (tx, rx) = mpsc::channel((hello.max_in_flight as usize).clamp(1, 4096) * 2 + 8);
         let connection = self.register(hello, tx.clone())?;
-        tx.send(Ok(wire::ServerMessage {
+        let metrics = self.inner.lock().unwrap().workers[&id].metrics.clone();
+        tx.send(Outbound::new(Ok(wire::ServerMessage {
             payload: Some(wire::server_message::Payload::Welcome(wire::Welcome {
                 protocol_version: PROTOCOL_VERSION,
                 connection_id: connection.clone(),
             })),
-        }))
+        })))
         .await
         .map_err(|_| Status::cancelled("connection closed"))?;
         tracing::info!(worker=%id,connection=%connection,"inference worker ready");
@@ -617,6 +980,8 @@ impl WorkerService for WorkerPool {
             }
             pool.disconnect(&id, &connection, "worker stream ended");
         });
-        Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
+        Ok(Response::new(Box::pin(
+            ReceiverStream::new(rx).map(move |msg| msg.into_message(&metrics)),
+        )))
     }
 }

@@ -4,6 +4,7 @@ use go_server::{
     app::App,
     session::{SessionConfig, Sessions},
     worker::WorkerPool,
+    worker_schedule::{Scheduler, SchedulingConfig},
 };
 use std::{net::SocketAddr, time::Duration};
 
@@ -25,6 +26,15 @@ struct Args {
     max_nodes: usize,
     #[arg(long, default_value_t = 128)]
     max_in_flight: usize,
+    /// Opt-in until heterogeneous GPU/network ABBA acceptance is complete.
+    #[arg(long, value_enum, default_value_t = Scheduler::Legacy)]
+    worker_scheduler: Scheduler,
+    /// Per-worker dispatch window, clipped to Hello capacity (not a GPU batch).
+    #[arg(long)]
+    worker_target_inflight: Option<usize>,
+    /// Override a worker window, repeatable: --worker-target ID=64.
+    #[arg(long, value_parser = parse_worker_target)]
+    worker_target: Vec<(String, usize)>,
     #[arg(long, default_value_t = 4)]
     max_sessions: usize,
     #[arg(long, default_value_t = 120)]
@@ -73,10 +83,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.retention = Duration::from_secs(args.session_retention_secs);
     config.publish = Duration::from_millis(args.publish_ms);
     go_core::Search::new(go_core::Position::new(19, 7.5)?, config.search.clone())?;
-    let pool = WorkerPool::new(
+    let scheduling = SchedulingConfig {
+        scheduler: args.worker_scheduler,
+        target_inflight: args.worker_target_inflight,
+        worker_targets: args.worker_target.into_iter().collect(),
+    };
+    let pool = WorkerPool::with_scheduling(
         args.model_sha256.map(|s| s.to_ascii_lowercase()),
         Duration::from_millis(args.lease_ms),
-    );
+        scheduling,
+    )?;
     let sessions = Sessions::new(config, pool.clone());
     let app = App::new(sessions.clone(), pool.clone());
     let listener = tokio::net::TcpListener::bind(args.http).await?;
@@ -93,7 +109,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut grpc = tokio::spawn(async move {
         tonic::transport::Server::builder()
             .add_service(grpc_service)
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(grpc_socket))
+            .serve_with_incoming(
+                tonic::transport::server::TcpIncoming::from(grpc_socket).with_nodelay(Some(true)),
+            )
             .await
     });
     let maintenance = tokio::spawn(async move {
@@ -129,4 +147,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gtp.abort();
     }
     outcome
+}
+
+fn parse_worker_target(value: &str) -> Result<(String, usize), String> {
+    let (id, target) = value.split_once('=').ok_or("expected WORKER_ID=COUNT")?;
+    let target = target
+        .parse::<usize>()
+        .map_err(|_| "target must be an integer")?;
+    if id.is_empty() || id.len() > 128 || !(1..=4096).contains(&target) {
+        return Err("worker id must be 1..=128 bytes and target 1..=4096".into());
+    }
+    Ok((id.into(), target))
 }
