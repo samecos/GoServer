@@ -52,7 +52,7 @@ generation 在切换根或分析任务代次变化时递增，version 单调递�
 
 Server 的 CPU 搜索内核可用 `--search-simd auto|scalar|avx512` 选择，默认 `auto`。`/health.configuration.search.simd` 是请求值，`/health.configuration.searchSimdSelected` 是实际选择值。`auto` 在 CPU/OS 支持 AVX-512F 时使用8路 FP64候选评分，否则回退标量；显式选择不受支持的内核会在启动时失败。此开关不改变 Worker/GPU 后端、网络协议、规则或候选排序语义。
 
-默认每会话搜索图预算为32 GiB（`max_memory_bytes=34359738368`），节点上限为100万（`max_nodes=1000000`）；可通过 `--graph-memory-mib` 和 `--max-nodes` 覆盖，实际配置见 `/health.configuration.search`。两项上限独立生效，达到容量后仍报告 `memory_limited`。预算按需使用、按会话独立计费，并非整个进程的共享内存池或 RSS 硬上限。
+默认每会话搜索图预算为32 GiB（`max_memory_bytes=34359738368`），节点上限为1亿（`max_nodes=100000000`）；可通过 `--graph-memory-mib` 和 `--max-nodes` 覆盖，实际配置见 `/health.configuration.search`。两项上限独立生效，达到容量后仍报告 `memory_limited`。预算按需使用、按会话独立计费，并非整个进程的共享内存池或 RSS 硬上限。提高节点上限不会自动扩大内存预算；现有二进制可显式传入 `--max-nodes 100000000`，源码默认值需重新构建后生效。
 
 `/health.configuration.workerScheduling` 返回实际启动配置。`/api/workers` 和快照中的 Worker 增加以下兼容字段；旧的 EWMA 字段仍保留。所有计数器以连接为边界，重连须按 `connectionId` 分段。
 

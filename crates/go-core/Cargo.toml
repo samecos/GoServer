@@ -8,6 +8,11 @@ license = "MIT"
 [features]
 # Opt-in inclusive CPU stage timers for local experiments; absent in production.
 search-profiling = []
+search-hotspots = ["search-profiling"]
+# Candidate: omit only redundant catch-up refresh on a proven single-parent path.
+catchup-path-refresh = []
+ancestor-single-set = []
+sparse-child-iteration = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

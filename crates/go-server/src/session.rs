@@ -982,6 +982,36 @@ impl Actor {
             "settings":{"komi":self.komi,"rules":"chinese"},"terminal":p.terminal(),"analysis":{"enabled":self.enabled,"status":self.status,"reason":self.reason,"root":root,"candidates":candidates,
                 "visits":ss.root.visits,"nodesPerSecond":self.rate,"graphNodes":ss.nodes,"memoryBytes":ss.memory_bytes,"inFlight":ss.in_flight,
                 "evaluationsCompleted":ss.evaluations_completed,"transpositionHits":ss.transposition_hits,"catchUpVisits":ss.catch_up_visits},"workers":self.pool.snapshot_views()});
+        #[cfg(feature = "search-profiling")]
+        let value = {
+            let mut value = value;
+            let activity = go_core::profiling::take_activity();
+            let stages: serde_json::Map<String, Value> = go_core::profiling::NAMES
+                .into_iter()
+                .zip(go_core::profiling::take())
+                .map(|(name, sample)| (name.into(), json!(sample)))
+                .collect();
+            value["analysis"]["cpuProfile"] = json!({
+                "windowSeconds": self.last_publish.elapsed().as_secs_f64(),
+                "activity": activity,
+                "inclusiveStages": stages,
+                "maxNodes": self.search.config().max_nodes,
+                "maxMemoryBytes": self.search.config().max_memory_bytes,
+                "maxDepth": self.search.config().max_depth,
+            });
+            tracing::info!(target: "go_server::search_profile",
+                session = %self.id,
+                generation = self.generation,
+                position = self.cursor,
+                graph_nodes = ss.nodes,
+                memory_bytes = ss.memory_bytes,
+                visits = ss.root.visits,
+                in_flight = ss.in_flight,
+                catch_up_visits = ss.catch_up_visits,
+                cpu_profile = %value["analysis"]["cpuProfile"],
+                "search CPU profile");
+            value
+        };
         self.snapshots.send_replace(value.clone());
         self.last_publish = Instant::now();
         value

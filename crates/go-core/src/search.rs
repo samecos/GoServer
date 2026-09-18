@@ -69,6 +69,35 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "sparse-child-iteration")]
+    #[test]
+    fn sparse_edges_keep_order_and_distinct_edges_when_rebound() {
+        let mut node = Node::new(&Position::new(19, 7.5).unwrap());
+        for i in 0..362 {
+            node.edges.push(Edge {
+                point: Some(i),
+                prior: 0.0,
+                child: None,
+                visits: 0,
+                in_flight: 0,
+            });
+        }
+        for (edge, child) in [(361, 1), (7, 2), (2, 2), (7, 3), (0, 4)] {
+            node.set_child(edge, child);
+        }
+        assert_eq!(node.linked_edges, vec![0, 2, 7, 361]);
+        assert_eq!(
+            node.connected_edges()
+                .map(|e| e.child.unwrap())
+                .collect::<Vec<_>>(),
+            vec![4, 2, 3, 1]
+        );
+        assert!(
+            std::mem::size_of::<Node>() <= 512,
+            "fixed metadata charge must cover sparse index metadata"
+        );
+    }
+
     fn stats(visits: u64, q: f64, weight: f64) -> NodeStats {
         NodeStats {
             visits,
@@ -90,6 +119,7 @@ mod tests {
         id
     }
     fn link(s: &mut Search, parent: usize, child: usize, visits: u64, point: u16) {
+        let edge = s.nodes[parent].edges.len();
         s.nodes[parent].edges.push(Edge {
             point: Some(point),
             prior: 0.5,
@@ -97,7 +127,92 @@ mod tests {
             visits,
             in_flight: 0,
         });
+        s.nodes[parent].set_child(edge, child);
         s.nodes[child].parents.insert(parent);
+    }
+
+    #[cfg(feature = "sparse-child-iteration")]
+    #[test]
+    fn sparse_edges_survive_root_collection_and_child_id_remapping() {
+        let mut s = Search::new(Position::new(19, 7.5).unwrap(), SearchConfig::default()).unwrap();
+        add_node(&mut s, 0.0, 1); // unreachable node is reclaimed
+        let root = add_node(&mut s, 0.1, 4);
+        let leaf = add_node(&mut s, 0.2, 8);
+        link(&mut s, 0, root, 1, 0);
+        link(&mut s, root, leaf, 1, 1);
+        link(&mut s, root, leaf, 2, 2); // distinct edges must remain distinct
+        s.root = root;
+        s.collect_unreachable();
+        assert_eq!(s.root, 0);
+        assert_eq!(s.nodes.len(), 2);
+        assert_eq!(
+            s.nodes[0]
+                .connected_edges()
+                .map(|e| e.child.unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+        for n in &s.nodes {
+            assert_eq!(
+                n.linked_edges,
+                n.edges
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, e)| e.child.map(|_| i as u16))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn catch_up_refresh_matches_full_refresh_with_shared_ancestors() {
+        fn graph(extra_parent: bool) -> Search {
+            let mut s =
+                Search::new(Position::new(19, 7.5).unwrap(), SearchConfig::default()).unwrap();
+            s.nodes[0].state = State::Expanded;
+            s.nodes[0].raw = Some(stats(1, 0.1, 1.0));
+            s.nodes[0].stats = stats(1, 0.1, 1.0);
+            let parent = add_node(&mut s, -0.2, 1);
+            let child = add_node(&mut s, 0.6, 100);
+            link(&mut s, 0, parent, 0, 0);
+            link(&mut s, parent, child, 0, 1);
+            let other = add_node(&mut s, -0.4, 2);
+            // Shared child is unchanged by catch-up, so it does not prevent
+            // skipping the refresh. A shared changed parent does prevent it.
+            link(
+                &mut s,
+                other,
+                if extra_parent { parent } else { child },
+                1,
+                2,
+            );
+            s.recompute(other);
+            s
+        }
+        for extra_parent in [false, true] {
+            let mut baseline = graph(extra_parent);
+            let mut candidate = graph(extra_parent);
+            let path = [(0, 0), (1, 0)];
+            assert_eq!(
+                candidate.path_covers_ancestors(1, &path[..1]),
+                !extra_parent
+            );
+            for _ in 0..40 {
+                baseline.commit_path(&path);
+                baseline.refresh_ancestors(1);
+                candidate.commit_catch_up_path(1, &path);
+                for (a, b) in baseline.nodes.iter().zip(&candidate.nodes) {
+                    assert_eq!(a.stats, b.stats);
+                    for (ae, be) in a.edges.iter().zip(&b.edges) {
+                        assert_eq!(ae.visits, be.visits);
+                        assert_eq!(ae.in_flight, be.in_flight);
+                    }
+                }
+            }
+            // Cycles / incoming root edges must never enter the shortcut.
+            link(&mut candidate, 2, 0, 1, 3);
+            assert!(!candidate.path_covers_ancestors(1, &path[..1]));
+        }
     }
 
     #[test]
@@ -124,7 +239,16 @@ mod tests {
         s.nodes[tactic].state = State::Terminal;
         link(&mut s, c, tactic, 199, 2);
         s.nodes[c].stats.visits = 200;
+        #[cfg(feature = "search-profiling")]
+        crate::profiling::take_activity();
         s.refresh_ancestors(c);
+        #[cfg(feature = "search-profiling")]
+        {
+            let activity = crate::profiling::take_activity();
+            assert_eq!(activity.ancestor_dirty_nodes, 3);
+            assert_eq!(activity.ancestor_dirty_max, 3);
+            assert_eq!(activity.ancestor_edges_scanned, 3);
+        }
         let expected_c = (0.39 + 199.0 * 0.51) / 200.0;
         let after = s.nodes[a].stats;
         assert!((after.utility - (0.39 + 30.0 * expected_c) / 31.0).abs() < 1e-12);
@@ -132,6 +256,85 @@ mod tests {
         assert_eq!(after.visits, before.visits);
         assert_eq!(s.nodes[a].edges[0].visits, 30);
         assert_eq!(s.nodes[b].edges[0].visits, 70);
+    }
+
+    #[test]
+    fn direct_refresh_preserves_dfs_order_for_shared_nodes_and_cycles() {
+        fn reference(
+            s: &mut Search,
+            node: usize,
+            dirty: &HashSet<usize>,
+            visited: &mut HashSet<usize>,
+            active: &mut HashSet<usize>,
+        ) {
+            if visited.contains(&node) || !active.insert(node) {
+                return;
+            }
+            let children: Vec<_> = s.nodes[node]
+                .edges
+                .iter()
+                .filter_map(|e| e.child)
+                .filter(|c| dirty.contains(c))
+                .collect();
+            for child in children {
+                reference(s, child, dirty, visited, active);
+            }
+            active.remove(&node);
+            visited.insert(node);
+            s.recompute(node);
+        }
+        fn graph(cycle: bool) -> Search {
+            let mut s =
+                Search::new(Position::new(19, 7.5).unwrap(), SearchConfig::default()).unwrap();
+            for i in 0..8 {
+                add_node(&mut s, (i as f64 - 4.0) / 8.0, 30);
+            }
+            for (a, b) in [
+                (1, 2),
+                (1, 3),
+                (2, 4),
+                (3, 4),
+                (4, 5),
+                (4, 6),
+                (5, 7),
+                (6, 7),
+                (3, 8),
+            ] {
+                link(&mut s, a, b, 3, b as u16);
+            }
+            if cycle {
+                link(&mut s, 7, 2, 2, 10);
+            }
+            s
+        }
+        for cycle in [false, true] {
+            for reverse in [false, true] {
+                let mut expected = graph(cycle);
+                let mut actual = graph(cycle);
+                let dirty: HashSet<_> = (1..8).collect(); // node 8 must stay untouched
+                let mut order: Vec<_> = (1..8).collect();
+                if reverse {
+                    order.reverse();
+                }
+                for _ in 0..8 {
+                    let (mut ev, mut ea, mut av, mut aa) = (
+                        HashSet::new(),
+                        HashSet::new(),
+                        HashSet::new(),
+                        HashSet::new(),
+                    );
+                    for &node in &order {
+                        reference(&mut expected, node, &dirty, &mut ev, &mut ea);
+                        actual.refresh_recursive(node, &dirty, &mut av, &mut aa);
+                    }
+                    assert_eq!(ev, av);
+                    assert!(ea.is_empty() && aa.is_empty());
+                    for (a, b) in expected.nodes.iter().zip(&actual.nodes) {
+                        assert_eq!(a.stats, b.stats);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -406,7 +609,7 @@ impl Default for SearchConfig {
     fn default() -> Self {
         Self {
             simd: SearchSimd::Auto,
-            max_nodes: 1_000_000,
+            max_nodes: 100_000_000,
             max_memory_bytes: 32 * 1024 * 1024 * 1024,
             max_in_flight: 128,
             max_depth: 1000,
@@ -573,6 +776,8 @@ struct Node {
     raw: Option<NodeStats>,
     stats: NodeStats,
     edges: Vec<Edge>,
+    #[cfg(feature = "sparse-child-iteration")]
+    linked_edges: Vec<u16>,
     parents: HashSet<usize>,
     in_flight: u32,
     ownership: Vec<f64>,
@@ -587,10 +792,34 @@ impl Node {
             raw: None,
             stats: NodeStats::default(),
             edges: Vec::new(),
+            #[cfg(feature = "sparse-child-iteration")]
+            linked_edges: Vec::new(),
             parents: HashSet::new(),
             in_flight: 0,
             ownership: Vec::new(),
             force_non_terminal: false,
+        }
+    }
+    fn set_child(&mut self, edge: usize, child: usize) {
+        self.edges[edge].child = Some(child);
+        #[cfg(feature = "sparse-child-iteration")]
+        {
+            let edge = u16::try_from(edge).expect("19x19 edge index");
+            if let Err(at) = self.linked_edges.binary_search(&edge) {
+                self.linked_edges.insert(at, edge);
+            }
+        }
+    }
+    // Keep the original legal-edge order, including distinct edges sharing a
+    // child. Rebinding an edge must not duplicate its index.
+    fn connected_edges(&self) -> impl ExactSizeIterator<Item = &Edge> {
+        #[cfg(feature = "sparse-child-iteration")]
+        {
+            self.linked_edges.iter().map(|&i| &self.edges[i as usize])
+        }
+        #[cfg(not(feature = "sparse-child-iteration"))]
+        {
+            self.edges.iter()
         }
     }
 }
@@ -740,6 +969,14 @@ impl Search {
     }
 
     pub fn next_evaluation(&mut self) -> Result<SearchStep, SearchError> {
+        let _timer = Span::new(Stage::NextEvaluation);
+        let result = self.next_evaluation_inner();
+        #[cfg(feature = "search-profiling")]
+        crate::profiling::record_step(&result);
+        result
+    }
+
+    fn next_evaluation_inner(&mut self) -> Result<SearchStep, SearchError> {
         if let Some(outcome) = self.position.terminal() {
             if self.nodes[self.root].stats.visits == 0 {
                 self.initialize_terminal(self.root, outcome);
@@ -835,6 +1072,8 @@ impl Search {
                     },
                 );
                 self.pending_memory_bytes += extra;
+                #[cfg(feature = "search-profiling")]
+                crate::profiling::record_leaf(path.len());
                 return Some(SearchStep::Evaluate(request));
             }
             State::Terminal => return None,
@@ -854,21 +1093,39 @@ impl Search {
                 point: self.nodes[node].edges[edge_idx].point,
             };
             let replay_timer = Span::new(Stage::Replay);
+            let clone_timer = Span::new(Stage::PositionClone);
             let mut child_position = position.clone();
+            drop(clone_timer);
             // GraphHash's bounded history can intentionally share representatives;
             // actual path legality/terminal status is always checked, never copied.
             let can_force_friendly =
                 m.point.is_none() && position.friendly_pass_would_force_non_terminal();
-            if child_position.play_search(m).is_err() {
+            let play_timer = Span::new(Stage::BoardPlay);
+            let played = child_position.play_search(m);
+            drop(play_timer);
+            if played.is_err() {
                 continue;
             }
             let force_non_terminal = can_force_friendly && child_position.terminal().is_some();
-            let key = Self::node_key(&child_position, force_non_terminal);
+            let key = {
+                let _timer = Span::new(Stage::GraphKey);
+                Self::node_key(&child_position, force_non_terminal)
+            };
             drop(replay_timer);
             let child = match self.nodes[node].edges[edge_idx].child {
-                Some(c) if self.nodes[c].key == key => c,
+                Some(c) if self.nodes[c].key == key => {
+                    #[cfg(feature = "search-hotspots")]
+                    crate::profiling::hotspots::edge(true);
+                    c
+                }
                 _ => {
-                    let child = if let Some(c) = self.index.get(&key).copied() {
+                    #[cfg(feature = "search-hotspots")]
+                    crate::profiling::hotspots::edge(false);
+                    let cached = {
+                        let _timer = Span::new(Stage::GraphLookup);
+                        self.index.get(&key).copied()
+                    };
+                    let child = if let Some(c) = cached {
                         self.transposition_hits += 1;
                         c
                     } else {
@@ -905,11 +1162,17 @@ impl Search {
                         self.index.insert(key, c);
                         c
                     };
-                    self.nodes[node].edges[edge_idx].child = Some(child);
+                    self.nodes[node].set_child(edge_idx, child);
                     self.nodes[child].parents.insert(node);
                     child
                 }
             };
+            #[cfg(feature = "search-hotspots")]
+            crate::profiling::hotspots::path(
+                self.nodes[child].key,
+                self.nodes[node].key,
+                &child_position,
+            );
             if matches!(self.nodes[child].state, State::Evaluating(_)) {
                 continue;
             }
@@ -918,8 +1181,7 @@ impl Search {
             // parent-edge event can reuse child information without a new playout.
             if self.nodes[node].edges[edge_idx].visits < self.nodes[child].stats.visits {
                 self.catch_up_visits += 1;
-                self.commit_path(path);
-                self.refresh_ancestors(node);
+                self.commit_catch_up_path(node, path);
                 self.version += 1;
                 path.pop();
                 return Some(SearchStep::Advanced);
@@ -1011,6 +1273,7 @@ impl Search {
         token: EvalToken,
         evaluation: Evaluation,
     ) -> Result<Completion, SearchError> {
+        let _timer = Span::new(Stage::CompleteEvaluation);
         let Some(pending) = self.pending.get(&token) else {
             return Ok(Completion::Stale);
         };
@@ -1059,6 +1322,8 @@ impl Search {
         self.nodes[p.node].stats = raw;
         self.nodes[p.node].state = State::Expanded;
         self.nodes[p.node].edges = edges;
+        #[cfg(feature = "sparse-child-iteration")]
+        self.nodes[p.node].linked_edges.clear();
         self.nodes[p.node].ownership = evaluation.ownership;
         self.reserve_path(p.node, &p.path, false);
         // Finish the leaf's idempotent normalization before updating its parents.
@@ -1109,6 +1374,41 @@ impl Search {
             self.nodes[*parent].edges[*edge].visits += 1;
             self.nodes[*parent].stats.visits += 1;
             self.recompute(*parent);
+        }
+    }
+
+    fn commit_catch_up_path(&mut self, node: usize, path: &[(usize, usize)]) {
+        #[cfg(feature = "search-hotspots")]
+        let before = crate::profiling::peek_activity();
+        #[cfg(feature = "search-hotspots")]
+        let started = std::time::Instant::now();
+        self.commit_path(path);
+        // The final edge belongs to `node`: catch-up changes its edge count,
+        // not the shared child's value. commit_path already recomputed node and
+        // every parent on this path. Only skip the second pass when that path
+        // covers ALL parents of node, including the no-parent root boundary.
+        // Shared parents and cycles retain the original full graph refresh.
+        let covered = cfg!(feature = "catchup-path-refresh")
+            && self.path_covers_ancestors(node, &path[..path.len() - 1]);
+        if !covered {
+            self.refresh_ancestors(node);
+        }
+        #[cfg(feature = "search-hotspots")]
+        {
+            let nanos = started.elapsed().as_nanos() as u64;
+            let after = crate::profiling::peek_activity();
+            let child = self.nodes[node].edges[path.last().unwrap().1]
+                .child
+                .unwrap();
+            crate::profiling::hotspots::catchup(
+                self.nodes[child].key,
+                self.nodes[node].key,
+                self.nodes[child].parents.len(),
+                path.len(),
+                after.ancestor_dirty_nodes - before.ancestor_dirty_nodes,
+                after.ancestor_edges_scanned - before.ancestor_edges_scanned,
+                nanos,
+            );
         }
     }
     fn raw_stats(&self, e: &Evaluation) -> NodeStats {
@@ -1215,8 +1515,7 @@ impl Search {
         children.clear();
         children.extend(
             self.nodes[node]
-                .edges
-                .iter()
+                .connected_edges()
                 .filter_map(|e| e.child.map(|c| (self.nodes[c].stats, e.visits)))
                 .filter(|(s, v)| s.visits > 0 && s.weight_sum > 0.0 && *v > 0)
                 .map(|(s, v)| (s, s.child_weight(v))),
@@ -1275,7 +1574,9 @@ impl Search {
         }
         let mut visited = HashSet::new();
         let mut active = HashSet::new();
-        for n in dirty.iter().copied().collect::<Vec<_>>() {
+        #[cfg(feature = "search-profiling")]
+        crate::profiling::record_ancestor_dirty(dirty.len());
+        for n in dirty.iter().copied() {
             self.refresh_recursive(n, &dirty, &mut visited, &mut active);
         }
     }
@@ -1286,20 +1587,31 @@ impl Search {
         visited: &mut HashSet<usize>,
         active: &mut HashSet<usize>,
     ) {
-        if visited.contains(&node) || !active.insert(node) {
+        // Both active and completed nodes are skipped by the reference DFS.
+        // Marking on entry represents their union without changing edge order,
+        // postorder recomputation, or how back edges break cycles.
+        let already_seen = if cfg!(feature = "ancestor-single-set") {
+            !visited.insert(node)
+        } else {
+            visited.contains(&node) || !active.insert(node)
+        };
+        if already_seen {
             return;
         }
+        #[cfg(feature = "search-profiling")]
+        crate::profiling::record_ancestor_edges(self.nodes[node].connected_edges().len());
         let children: Vec<_> = self.nodes[node]
-            .edges
-            .iter()
+            .connected_edges()
             .filter_map(|e| e.child)
             .filter(|c| dirty.contains(c))
             .collect();
         for c in children {
             self.refresh_recursive(c, dirty, visited, active);
         }
-        active.remove(&node);
-        visited.insert(node);
+        if !cfg!(feature = "ancestor-single-set") {
+            active.remove(&node);
+            visited.insert(node);
+        }
         self.recompute(node);
     }
 
@@ -1337,6 +1649,8 @@ impl Search {
             // subtree. Keep the valid root NN value and safely reclaim children.
             let mut root = self.nodes.swap_remove(self.root);
             root.edges.clear();
+            #[cfg(feature = "sparse-child-iteration")]
+            root.linked_edges.clear();
             root.parents.clear();
             if let Some(raw) = root.raw {
                 root.stats = raw;
@@ -1366,6 +1680,15 @@ impl Search {
         for n in &mut nodes {
             for e in &mut n.edges {
                 e.child = e.child.and_then(|c| remap.get(&c).copied());
+            }
+            #[cfg(feature = "sparse-child-iteration")]
+            {
+                n.linked_edges = n
+                    .edges
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, e)| e.child.map(|_| i as u16))
+                    .collect();
             }
             n.parents.clear();
         }

@@ -75,12 +75,21 @@ fn fixture(name: &str) -> Position {
     p
 }
 
-fn synthetic(p: &Position) -> Evaluation {
+fn synthetic(p: &Position, transpositions: bool) -> Evaluation {
     let hash = p.input_hash();
     let seed = u64::from_le_bytes(hash[..8].try_into().unwrap());
     let policy = (0..362)
         .map(|i| {
-            let rank = (i as u64 * 137 + seed % 361) % 361;
+            let offset = if transpositions {
+                if p.to_move() == Color::Black {
+                    17
+                } else {
+                    149
+                }
+            } else {
+                seed % 361
+            };
+            let rank = (i as u64 * 137 + offset) % 361;
             if i == 361 {
                 0.00001
             } else {
@@ -106,6 +115,7 @@ fn synthetic(p: &Position) -> Evaluation {
 }
 
 fn run(name: &str, window: usize, evaluations: usize) -> serde_json::Value {
+    let transpositions = std::env::var("SEARCH_BENCH_TRANSPOSITIONS").is_ok_and(|v| v == "1");
     let mut search = Search::new(
         fixture(name),
         SearchConfig {
@@ -126,6 +136,8 @@ fn run(name: &str, window: usize, evaluations: usize) -> serde_json::Value {
     let (mut issued, mut completed, mut advanced) = (0usize, 0usize, 0usize);
     let (mut next_ns, mut complete_ns, mut eval_ns, mut snapshot_ns) = (0u128, 0u128, 0u128, 0u128);
     profiling::take();
+    #[cfg(feature = "search-profiling")]
+    profiling::take_activity();
     let started = Instant::now();
     while completed < evaluations {
         while issued < evaluations && pending.len() < window {
@@ -147,7 +159,7 @@ fn run(name: &str, window: usize, evaluations: usize) -> serde_json::Value {
         }
         let request = pending.pop_front().expect("search made no progress");
         let t = Instant::now();
-        let evaluation = synthetic(&request.position);
+        let evaluation = synthetic(&request.position, transpositions);
         eval_ns += t.elapsed().as_nanos();
         let t = Instant::now();
         assert_eq!(
@@ -170,12 +182,20 @@ fn run(name: &str, window: usize, evaluations: usize) -> serde_json::Value {
         .zip(stats)
         .map(|(name, sample)| (name.into(), serde_json::to_value(sample).unwrap()))
         .collect();
-    json!({"fixture":name,"window":window,"evaluations":completed,"advanced":advanced,"simdBackend":search.simd_backend(),
+    let result = json!({"fixture":name,"window":window,"evaluations":completed,"advanced":advanced,"simdBackend":search.simd_backend(),
+        "transpositionPolicy":transpositions,
         "useUncertainty":search.config().use_uncertainty,
         "seconds":elapsed,"evaluationsPerSecond":completed as f64/elapsed,
         "nextNs":next_ns,"completeNs":complete_ns,"syntheticEvaluatorNs":eval_ns,"snapshotNs":snapshot_ns,
         "profilingEnabled":cfg!(feature="search-profiling"),"inclusiveStages":stage_samples,
-        "traceSha256":format!("{:x}",trace.finalize()),"snapshot":snapshot})
+        "traceSha256":format!("{:x}",trace.finalize()),"snapshot":snapshot});
+    #[cfg(feature = "search-profiling")]
+    let result = {
+        let mut result = result;
+        result["activity"] = serde_json::to_value(profiling::take_activity()).unwrap();
+        result
+    };
+    result
 }
 
 fn main() {

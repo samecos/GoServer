@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+search-profiling = ["go-core/search-profiling"]
+search-hotspots = ["search-profiling", "go-core/search-hotspots"]
+catchup-path-refresh = ["go-core/catchup-path-refresh"]
+ancestor-single-set = ["go-core/ancestor-single-set"]
+sparse-child-iteration = ["go-core/sparse-child-iteration"]
+
 [dependencies]
 go-core = { path = "../go-core" }
 go-protocol = { path = "../go-protocol" }
