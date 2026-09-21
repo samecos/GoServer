@@ -6,9 +6,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::time::Instant;
 use thiserror::Error;
 
+mod reclamation;
 mod scoring;
+pub use reclamation::ReclamationSnapshot;
+use reclamation::{Reclaimer, RetiredGraph};
+
+#[cfg(test)]
+mod root_collection_tests;
 
 /// Deterministic KataGo-compatible parameter profile. Optional neural uncertainty
 /// weighting uses the evaluator's short-term error outputs. Dynamic score utility,
@@ -19,6 +26,8 @@ pub struct SearchConfig {
     pub simd: SearchSimd,
     pub max_nodes: usize,
     pub max_memory_bytes: usize,
+    /// Move large detached graphs to a bounded, exclusively owning drop worker.
+    pub background_reclamation: bool,
     pub max_in_flight: usize,
     pub max_depth: usize,
     pub selection_work_budget: usize,
@@ -69,7 +78,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "sparse-child-iteration")]
     #[test]
     fn sparse_edges_keep_order_and_distinct_edges_when_rebound() {
         let mut node = Node::new(&Position::new(19, 7.5).unwrap());
@@ -131,7 +139,6 @@ mod tests {
         s.nodes[child].parents.insert(parent);
     }
 
-    #[cfg(feature = "sparse-child-iteration")]
     #[test]
     fn sparse_edges_survive_root_collection_and_child_id_remapping() {
         let mut s = Search::new(Position::new(19, 7.5).unwrap(), SearchConfig::default()).unwrap();
@@ -147,8 +154,9 @@ mod tests {
         assert_eq!(s.nodes.len(), 2);
         assert_eq!(
             s.nodes[0]
-                .connected_edges()
-                .map(|e| e.child.unwrap())
+                .edges
+                .iter()
+                .filter_map(|e| e.child)
                 .collect::<Vec<_>>(),
             vec![1, 1]
         );
@@ -611,6 +619,7 @@ impl Default for SearchConfig {
             simd: SearchSimd::Auto,
             max_nodes: 100_000_000,
             max_memory_bytes: 32 * 1024 * 1024 * 1024,
+            background_reclamation: true,
             max_in_flight: 128,
             max_depth: 1000,
             selection_work_budget: 4096,
@@ -688,11 +697,35 @@ pub struct SearchSnapshot {
     pub nodes: usize,
     /// Conservative charged storage budget, not the allocator's RSS.
     pub memory_bytes: usize,
+    #[serde(default)]
+    pub reclamation: ReclamationSnapshot,
+    #[serde(default)]
+    pub root_change: Option<RootChangeMetrics>,
     pub in_flight: usize,
     pub evaluations_completed: u64,
     pub transposition_hits: u64,
     pub catch_up_visits: u64,
     pub terminal: Option<Terminal>,
+}
+
+/// Milliseconds measured on the owner thread, except destruction, which is
+/// reported separately in ReclamationSnapshot. No per-playout graph traversal.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RootChangeMetrics {
+    pub generation: u64,
+    pub old_nodes: usize,
+    pub retained_nodes: usize,
+    pub cancel_ms: f64,
+    pub mark_ms: f64,
+    pub compact_ms: f64,
+    pub relink_ms: f64,
+    pub index_ms: f64,
+    pub retire_ms: f64,
+    pub total_ms: f64,
+    pub workspace_bytes: usize,
+    pub first_request_ms: Option<f64>,
+    pub first_completion_ms: Option<f64>,
+    pub first_analysis_ms: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -776,7 +809,6 @@ struct Node {
     raw: Option<NodeStats>,
     stats: NodeStats,
     edges: Vec<Edge>,
-    #[cfg(feature = "sparse-child-iteration")]
     linked_edges: Vec<u16>,
     parents: HashSet<usize>,
     in_flight: u32,
@@ -792,7 +824,6 @@ impl Node {
             raw: None,
             stats: NodeStats::default(),
             edges: Vec::new(),
-            #[cfg(feature = "sparse-child-iteration")]
             linked_edges: Vec::new(),
             parents: HashSet::new(),
             in_flight: 0,
@@ -802,7 +833,6 @@ impl Node {
     }
     fn set_child(&mut self, edge: usize, child: usize) {
         self.edges[edge].child = Some(child);
-        #[cfg(feature = "sparse-child-iteration")]
         {
             let edge = u16::try_from(edge).expect("19x19 edge index");
             if let Err(at) = self.linked_edges.binary_search(&edge) {
@@ -813,14 +843,7 @@ impl Node {
     // Keep the original legal-edge order, including distinct edges sharing a
     // child. Rebinding an edge must not duplicate its index.
     fn connected_edges(&self) -> impl ExactSizeIterator<Item = &Edge> {
-        #[cfg(feature = "sparse-child-iteration")]
-        {
-            self.linked_edges.iter().map(|&i| &self.edges[i as usize])
-        }
-        #[cfg(not(feature = "sparse-child-iteration"))]
-        {
-            self.edges.iter()
-        }
+        self.linked_edges.iter().map(|&i| &self.edges[i as usize])
     }
 }
 #[derive(Clone, Debug)]
@@ -851,6 +874,9 @@ pub struct Search {
     transposition_hits: u64,
     catch_up_visits: u64,
     has_shortterm_error: Option<bool>,
+    reclaimer: Reclaimer,
+    root_change: Option<RootChangeMetrics>,
+    root_changed_at: Option<Instant>,
 }
 impl Search {
     pub fn new(position: Position, config: SearchConfig) -> Result<Self, SearchError> {
@@ -909,6 +935,9 @@ impl Search {
             transposition_hits: 0,
             catch_up_visits: 0,
             has_shortterm_error: None,
+            reclaimer: Reclaimer::default(),
+            root_change: None,
+            root_changed_at: None,
         };
         if s.memory_bytes() > s.config.max_memory_bytes {
             return Err(SearchError::RootBudget);
@@ -934,17 +963,41 @@ impl Search {
         self.nodes[self.root].stats.visits
     }
 
+    /// Called by the publisher before composing a frame. An immediate retained
+    /// snapshot is not counted as fresh analysis until a new result is applied.
+    pub fn note_analysis_publication(&mut self) {
+        if let (Some(change), Some(start)) = (&mut self.root_change, self.root_changed_at) {
+            if change.first_completion_ms.is_some() && change.first_analysis_ms.is_none() {
+                change.first_analysis_ms = Some(start.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
+    }
+
     // Charge all potential edge slots (including unallocated slots), reverse
     // links, ownership and table overhead. Pending replay histories have their
     // own budget. This deliberately overestimates logical live storage.
     fn node_charge(&self) -> usize {
+        self.node_payload_charge() + Self::collection_reserve_per_node()
+    }
+    fn node_payload_charge(&self) -> usize {
         512 + self.position.board().len() * (std::mem::size_of::<Edge>() + 64)
+    }
+    // Reserve temporary compaction storage as the graph grows, so a full tree
+    // still has room for the dense mark/remap/stack, new node Vec and new index.
+    // The stack contains each node once and may have up to 2N Vec capacity.
+    fn collection_reserve_per_node() -> usize {
+        2 * std::mem::size_of::<Node>() + 4 * std::mem::size_of::<usize>() + 128
     }
     fn position_charge(&self, p: &Position) -> usize {
         1024 + p.board().len() + p.moves().len() * 128
     }
     pub fn memory_bytes(&self) -> usize {
         let _timer = Span::new(Stage::Memory);
+        self.active_memory_bytes()
+            .saturating_add(self.reclaimer.bytes())
+    }
+
+    fn active_memory_bytes(&self) -> usize {
         self.nodes.len().saturating_mul(self.node_charge())
             + self.position_charge(&self.position)
             + self.pending_memory_bytes
@@ -954,7 +1007,7 @@ impl Search {
     /// is transient, so it must drain before declaring this a permanent limit.
     /// Already allocated, unevaluated nodes must still be allowed to initialize.
     pub fn graph_budget_exhausted(&self) -> bool {
-        if !self.pending.is_empty() {
+        if !self.pending.is_empty() || self.reclaimer.bytes() != 0 {
             return false;
         }
         let used = self.memory_bytes();
@@ -970,7 +1023,21 @@ impl Search {
 
     pub fn next_evaluation(&mut self) -> Result<SearchStep, SearchError> {
         let _timer = Span::new(Stage::NextEvaluation);
-        let result = self.next_evaluation_inner();
+        let retiring = self.reclaimer.bytes() != 0;
+        let mut result = self.next_evaluation_inner();
+        // A transient retirement budget must not latch the session actor into
+        // memory_limited. Retry on its normal bounded wakeup after drops finish.
+        if retiring && matches!(result, Ok(SearchStep::MemoryLimited)) {
+            self.reclaimer.expedite();
+            result = Ok(SearchStep::Waiting);
+        }
+        if matches!(result, Ok(SearchStep::Evaluate(_))) {
+            if let (Some(change), Some(start)) = (&mut self.root_change, self.root_changed_at) {
+                change
+                    .first_request_ms
+                    .get_or_insert_with(|| start.elapsed().as_secs_f64() * 1000.0);
+            }
+        }
         #[cfg(feature = "search-profiling")]
         crate::profiling::record_step(&result);
         result
@@ -1322,7 +1389,6 @@ impl Search {
         self.nodes[p.node].stats = raw;
         self.nodes[p.node].state = State::Expanded;
         self.nodes[p.node].edges = edges;
-        #[cfg(feature = "sparse-child-iteration")]
         self.nodes[p.node].linked_edges.clear();
         self.nodes[p.node].ownership = evaluation.ownership;
         self.reserve_path(p.node, &p.path, false);
@@ -1335,6 +1401,11 @@ impl Search {
         }
         self.evaluations_completed += 1;
         self.version += 1;
+        if let (Some(change), Some(start)) = (&mut self.root_change, self.root_changed_at) {
+            change
+                .first_completion_ms
+                .get_or_insert_with(|| start.elapsed().as_secs_f64() * 1000.0);
+        }
         Ok(Completion::Applied)
     }
     pub fn fail(&mut self, token: EvalToken) -> Completion {
@@ -1619,14 +1690,24 @@ impl Search {
     /// Reuses reachable nodes only when board size/komi/context match. The caller
     /// must create a fresh Search for a different model/evaluation profile.
     pub fn set_root(&mut self, position: Position) -> Result<Vec<EvalToken>, SearchError> {
+        let started = Instant::now();
         let minimum_charge = 512
             + position.board().len() * (std::mem::size_of::<Edge>() + 64)
+            + Self::collection_reserve_per_node()
             + self.position_charge(&position);
         if minimum_charge > self.config.max_memory_bytes {
             return Err(SearchError::RootBudget);
         }
+        let cancel_start = Instant::now();
         let canceled = self.cancel_all();
         self.generation += 1;
+        self.root_change = Some(RootChangeMetrics {
+            generation: self.generation,
+            old_nodes: self.nodes.len(),
+            cancel_ms: cancel_start.elapsed().as_secs_f64() * 1000.0,
+            ..RootChangeMetrics::default()
+        });
+        self.root_changed_at = Some(started);
         let compatible = position.board_size() == self.position.board_size()
             && position.komi() == self.position.komi();
         let existing = if compatible {
@@ -1639,68 +1720,157 @@ impl Search {
             self.root = root;
             self.collect_unreachable();
         } else {
-            self.nodes = vec![Node::new(&self.position)];
+            let old_nodes = std::mem::replace(&mut self.nodes, vec![Node::new(&self.position)]);
             self.root = 0;
-            self.index = HashMap::from([(self.position.graph_key(), 0)]);
+            let old_index = std::mem::replace(
+                &mut self.index,
+                HashMap::from([(self.position.graph_key(), 0)]),
+            );
+            self.retire_graph(old_nodes, old_index);
         }
         self.version += 1;
-        if self.memory_bytes() > self.config.max_memory_bytes {
+        if self.active_memory_bytes() > self.config.max_memory_bytes {
             // A longer root replay can leave insufficient budget for the old
             // subtree. Keep the valid root NN value and safely reclaim children.
             let mut root = self.nodes.swap_remove(self.root);
             root.edges.clear();
-            #[cfg(feature = "sparse-child-iteration")]
             root.linked_edges.clear();
             root.parents.clear();
             if let Some(raw) = root.raw {
                 root.stats = raw;
             }
-            self.nodes = vec![root];
+            let old_nodes = std::mem::replace(&mut self.nodes, vec![root]);
             self.root = 0;
-            self.index = HashMap::from([(self.position.graph_key(), 0)]);
+            let old_index = std::mem::replace(
+                &mut self.index,
+                HashMap::from([(self.position.graph_key(), 0)]),
+            );
+            self.retire_graph(old_nodes, old_index);
         }
+        let change = self.root_change.as_mut().unwrap();
+        change.retained_nodes = if existing.is_some() {
+            self.nodes.len()
+        } else {
+            0
+        };
+        change.total_ms = started.elapsed().as_secs_f64() * 1000.0;
         Ok(canceled)
     }
+
+    fn retire_graph(&mut self, nodes: Vec<Node>, index: HashMap<Key, usize>) {
+        let start = Instant::now();
+        // Node charge covers payload; separately charge the old Vec's unused
+        // capacity and the detached hash table until the entire batch is gone.
+        let bytes = nodes
+            .len()
+            .saturating_mul(self.node_payload_charge())
+            .saturating_add(
+                (nodes.capacity() - nodes.len()).saturating_mul(std::mem::size_of::<Node>()),
+            )
+            .saturating_add(index.capacity().saturating_mul(64));
+        self.reclaimer.retire(
+            RetiredGraph {
+                nodes,
+                index,
+                bytes,
+            },
+            self.config.background_reclamation,
+            self.config.max_nodes.saturating_sub(self.nodes.len()),
+            self.config
+                .max_memory_bytes
+                .saturating_sub(self.active_memory_bytes()),
+        );
+        // Existing queued work may itself exceed the room left by a longer
+        // replay/new root. This is an explicit memory-pressure safe point.
+        if self.memory_bytes() > self.config.max_memory_bytes {
+            self.reclaimer.drain();
+        }
+        if let Some(change) = &mut self.root_change {
+            change.retire_ms += start.elapsed().as_secs_f64() * 1000.0;
+        }
+    }
+
     fn collect_unreachable(&mut self) {
-        let mut reachable = HashSet::new();
+        let start = Instant::now();
+        const UNSEEN: usize = usize::MAX;
+        const MARKED: usize = usize::MAX - 1;
+        let mut remap = vec![UNSEEN; self.nodes.len()];
         let mut stack = vec![self.root];
+        remap[self.root] = MARKED;
         while let Some(n) = stack.pop() {
-            if reachable.insert(n) {
-                stack.extend(self.nodes[n].edges.iter().filter_map(|e| e.child));
+            for &edge in &self.nodes[n].linked_edges {
+                let c = self.nodes[n].edges[edge as usize]
+                    .child
+                    .expect("linked child");
+                if remap[c] == UNSEEN {
+                    remap[c] = MARKED;
+                    stack.push(c);
+                }
             }
         }
-        let mut remap = HashMap::new();
-        let mut nodes = Vec::with_capacity(reachable.len());
-        for (old, n) in std::mem::take(&mut self.nodes).into_iter().enumerate() {
-            if reachable.contains(&old) {
-                remap.insert(old, nodes.len());
-                nodes.push(n);
+        let mut kept = 0;
+        for id in &mut remap {
+            if *id == MARKED {
+                *id = kept;
+                kept += 1;
             }
         }
+        if let Some(change) = &mut self.root_change {
+            change.mark_ms = start.elapsed().as_secs_f64() * 1000.0;
+            change.workspace_bytes =
+                (remap.capacity() + stack.capacity()) * std::mem::size_of::<usize>();
+        }
+        let start = Instant::now();
+        let mut nodes = Vec::with_capacity(kept);
+        // Removing in descending old-ID order leaves every earlier slot in
+        // place. Only live nodes move; dead payloads stay in the old allocation.
+        for old in (0..remap.len()).rev() {
+            if remap[old] != UNSEEN {
+                nodes.push(self.nodes.swap_remove(old));
+            }
+        }
+        nodes.reverse();
+        if let Some(change) = &mut self.root_change {
+            change.compact_ms = start.elapsed().as_secs_f64() * 1000.0;
+            change.workspace_bytes += nodes.capacity() * std::mem::size_of::<Node>();
+        }
+        let start = Instant::now();
         for n in &mut nodes {
-            for e in &mut n.edges {
-                e.child = e.child.and_then(|c| remap.get(&c).copied());
-            }
-            #[cfg(feature = "sparse-child-iteration")]
-            {
-                n.linked_edges = n
-                    .edges
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, e)| e.child.map(|_| i as u16))
-                    .collect();
+            // Every connected child of a retained node is retained. Edge order
+            // and the sparse edge index therefore stay exactly as they were.
+            for &i in &n.linked_edges {
+                let e = &mut n.edges[i as usize];
+                e.child = e.child.map(|c| remap[c]);
             }
             n.parents.clear();
         }
-        for n in 0..nodes.len() {
-            let children: Vec<_> = nodes[n].edges.iter().filter_map(|e| e.child).collect();
-            for c in children {
-                nodes[c].parents.insert(n);
+        // Rebinding an edge can leave historical reverse links in parents.
+        // Rebuild from forward edges, as the original collector did, rather
+        // than merely filtering old parent IDs (which would preserve ghosts).
+        for parent in 0..nodes.len() {
+            let count = nodes[parent].linked_edges.len();
+            for i in 0..count {
+                let i = nodes[parent].linked_edges[i] as usize;
+                if let Some(child) = nodes[parent].edges[i].child {
+                    nodes[child].parents.insert(parent);
+                }
             }
         }
-        self.root = remap[&self.root];
-        self.index = nodes.iter().enumerate().map(|(i, n)| (n.key, i)).collect();
-        self.nodes = nodes;
+        if let Some(change) = &mut self.root_change {
+            change.relink_ms = start.elapsed().as_secs_f64() * 1000.0;
+        }
+        let start = Instant::now();
+        self.root = remap[self.root];
+        let old_index = std::mem::replace(
+            &mut self.index,
+            nodes.iter().enumerate().map(|(i, n)| (n.key, i)).collect(),
+        );
+        let old_nodes = std::mem::replace(&mut self.nodes, nodes);
+        if let Some(change) = &mut self.root_change {
+            change.index_ms = start.elapsed().as_secs_f64() * 1000.0;
+            change.workspace_bytes += self.index.capacity() * 64;
+        }
+        self.retire_graph(old_nodes, old_index);
     }
     pub fn snapshot(&self, limit: usize, pv_len: usize) -> SearchSnapshot {
         let _timer = Span::new(Stage::Snapshot);
@@ -1773,6 +1943,8 @@ impl Search {
             ownership: n.ownership.clone(),
             nodes: self.nodes.len(),
             memory_bytes: self.memory_bytes(),
+            reclamation: self.reclaimer.snapshot(),
+            root_change: self.root_change.clone(),
             in_flight: self.pending.len(),
             evaluations_completed: self.evaluations_completed,
             transposition_hits: self.transposition_hits,

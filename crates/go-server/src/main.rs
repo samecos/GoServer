@@ -26,6 +26,9 @@ struct Args {
     /// Per-session node ceiling, independent of the graph memory budget.
     #[arg(long, default_value_t = go_core::SearchConfig::default().max_nodes)]
     max_nodes: usize,
+    /// Keep graph destruction on the session thread (diagnostic comparison).
+    #[arg(long)]
+    synchronous_graph_reclamation: bool,
     #[arg(long, default_value_t = 128)]
     max_in_flight: usize,
     /// CPU candidate scoring: auto, scalar or avx512.
@@ -83,6 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .checked_mul(1024 * 1024)
         .ok_or("graph memory limit overflow")?;
     config.search.max_nodes = args.max_nodes;
+    config.search.background_reclamation = !args.synchronous_graph_reclamation;
     config.search.max_in_flight = args.max_in_flight;
     config.search.simd = args.search_simd;
     config.max_sessions = args.max_sessions;

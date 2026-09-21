@@ -750,8 +750,10 @@ impl Actor {
                 Position::replay(19, komi, &line).map_err(|e| ApiError::new("ILLEGAL_MOVE", e))?;
                 let position = Position::replay(19, komi, &line[..cursor])
                     .map_err(|e| ApiError::new("ILLEGAL_MOVE", e))?;
+                let change_start = Instant::now();
                 self.cancel_genmove("position changed");
                 self.stop_tasks();
+                let stop_ms = change_start.elapsed().as_secs_f64() * 1000.0;
                 // Preserve monotonic core task identity across changes of komi.
                 self.search.set_root(position).map_err(ApiError::invalid)?;
                 self.line = line;
@@ -764,7 +766,16 @@ impl Actor {
                 self.rate = 0.0;
                 self.status = if self.enabled { "analyzing" } else { "idle" }.into();
                 self.reason = None;
-                Ok(self.publish())
+                let publish_start = Instant::now();
+                let value = self.publish();
+                tracing::info!(target: "go_server::root_change",
+                    session = %self.id, command = kind, generation = self.generation,
+                    stop_ms, publish_ms = publish_start.elapsed().as_secs_f64() * 1000.0,
+                    confirmation_ms = change_start.elapsed().as_secs_f64() * 1000.0,
+                    root_change = %value["analysis"]["rootChange"],
+                    reclamation = %value["analysis"]["reclamation"],
+                    "position change applied");
+                Ok(value)
             }
             _ => Err(ApiError::new("UNSUPPORTED", "unknown command")),
         }
@@ -904,7 +915,9 @@ impl Actor {
         true
     }
     fn finish_budget(&mut self) {
+        let change_start = Instant::now();
         self.stop_tasks();
+        let stop_ms = change_start.elapsed().as_secs_f64() * 1000.0;
         self.budget = None;
         if let Some(p) = self.pending.take() {
             self.enabled = p.previous_enabled;
@@ -938,7 +951,15 @@ impl Actor {
             self.rate = 0.0;
             self.status = if self.enabled { "analyzing" } else { "idle" }.into();
             self.reason = None;
+            let publish_start = Instant::now();
             let value = self.publish();
+            tracing::info!(target: "go_server::root_change",
+                session = %self.id, command = "genmove", generation = self.generation,
+                stop_ms, publish_ms = publish_start.elapsed().as_secs_f64() * 1000.0,
+                confirmation_ms = change_start.elapsed().as_secs_f64() * 1000.0,
+                root_change = %value["analysis"]["rootChange"],
+                reclamation = %value["analysis"]["reclamation"],
+                "position change applied");
             let _ = p.reply.send(Ok(value));
         } else {
             self.enabled = false;
@@ -948,6 +969,7 @@ impl Actor {
         }
     }
     fn publish(&mut self) -> Value {
+        self.search.note_analysis_publication();
         // Send all root candidates so clients can choose a display percentage.
         let ss = self.search.snapshot(362, 30);
         let p = self.search.position();
@@ -981,6 +1003,7 @@ impl Actor {
             "moves":self.line.iter().copied().map(move_json).collect::<Vec<_>>(),"position":self.cursor,"toPlay":p.to_move().stone(),"captures":captures,
             "settings":{"komi":self.komi,"rules":"chinese"},"terminal":p.terminal(),"analysis":{"enabled":self.enabled,"status":self.status,"reason":self.reason,"root":root,"candidates":candidates,
                 "visits":ss.root.visits,"nodesPerSecond":self.rate,"graphNodes":ss.nodes,"memoryBytes":ss.memory_bytes,"inFlight":ss.in_flight,
+                "reclamation":ss.reclamation,"rootChange":ss.root_change,
                 "evaluationsCompleted":ss.evaluations_completed,"transpositionHits":ss.transposition_hits,"catchUpVisits":ss.catch_up_visits},"workers":self.pool.snapshot_views()});
         #[cfg(feature = "search-profiling")]
         let value = {

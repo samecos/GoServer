@@ -1,14 +1,14 @@
 //! Real-NN FIFO capture and CPU-only replay. Never attaches to live sessions.
 //! capture FILE FIXTURES ID COUNT WINDOW; replay FILE
 use go_core::*;
-use go_protocol::v1::{worker_service_server::WorkerServiceServer, NnOutput};
+use go_protocol::v1::{NnOutput, worker_service_server::WorkerServiceServer};
 use go_server::{
     worker::WorkerPool,
     worker_schedule::{Scheduler, SchedulingConfig},
 };
 use prost::Message;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::{HashMap, VecDeque},
     fs::File,

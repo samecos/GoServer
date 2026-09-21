@@ -42,6 +42,14 @@
 
 真实 `memoryBytes` 由图预算计费计算，示例零值仅为结构占位，不代表根节点无开销。快照另含 `terminal:null` 或规则终局对象（`kind:"score",white_minus_black` / `kind:"no_result"`）。`analysis.enabled` 表示用户分析意图；没有算力或暂时无订阅者时仍可为 true。节点数、NN 完成数和 visits 是不同指标，不能互换。
 
+换根时先取消旧 EvalToken 和虚拟占用，再在会话线程上完成可达标记、编号映射和父索引重建；已摘除图由独立线程分批释放。`memoryBytes` 包含活动树（含换根临时空间预留）、待回收节点与其容器容量、待完成请求。`graphNodes` 只统计活动节点，因此落子后节点数下降而内存计费暂未下降是正常的。队列最多包含两个运行中/待处理批次，并受当前会话剩余字节和节点预算约束。内存暂被回收占用时搜索等待后重试；不会永久锁定为 `memory_limited`。预算不足、少于1024个退休节点或回收线程启动失败时同步释放，故不承诺任意规模固定落子延迟。会话退出会排空并 join 回收线程。
+
+`analysis.reclamation` 提供 `pending_nodes/pending_bytes/pending_batches/peak_pending_bytes`、累计 `reclaimed_nodes/completed_batches/synchronous_batches/drop_ms/backpressure_ms`。计费在整个批次释放后扣减，属于保守估算；后台可能在快照取样之间继续推进。`analysis.rootChange` 为最近一次核心换根的记录（尚未换根为 null），包含核心 `generation`、`old_nodes/retained_nodes`、`cancel_ms/mark_ms/compact_ms/relink_ms/index_ms/retire_ms/total_ms/workspace_bytes`，及从核心换根开始到首个新 NN 请求/有效完成的 `first_request_ms/first_completion_ms`（尚未发生为 null）。核心 generation 不等同于会话 generation。`total_ms` 不含网络与快照发布；客户端仍需测量命令往返和新代首帧。Server 的 `go_server::root_change` 日志另记停止任务、快照构造与确认耗时。
+
+默认启用后台回收；`--synchronous-graph-reclamation` 可用于诊断对照，`/health.configuration.search.background_reclamation` 返回实际值。此开关只改变析构调度，换根剪枝算法相同。
+
+`rootChange.first_analysis_ms` 是首个新有效结果应用后，Server 开始构造新分析快照的时间；尚未发生为 null。它不包含 WebSocket 发送和客户端绘制。普通回收每256个节点让出约1ms；队列/内存压力或退出时取消这段节奏延时、优先排空。`drop_ms` 是实际析构线程经过的墙钟时间，包含节奏延时，不能当成纯 CPU 耗时。
+
 `analysis.status` 为 idle/analyzing/waiting_workers/memory_limited/finished/error。无 NN 或搜索结果时 root=null、candidates=[]，不填演示数据。root 为 `{winRateBlack,scoreLeadBlack}`；候选为 `{index,color,winRateBlack,scoreLeadBlack,visits,weight,prior,pv:[{color,index}]}`，未访问候选的 winRateBlack/scoreLeadBlack 为 null。weight 是父边有效权重；PV 含候选第一手，只有该边存在时可仅一手。胜率范围0..1，目差为黑方正值领先；无胜负在展示胜率中按中性0.5处理。传输的 scoreLeadBlack 表示搜索目差均值，名称保留前端消费接口。
 
 generation 在切换根或分析任务代次变化时递增，version 单调递增。前端丢弃较旧 generation/version 的快照。快照默认约300ms合并发布；命令响应、停止和错误及时发送。短暂断线暂停无人订阅的搜索，服务保留会话供恢复；首版悬停不会新建推理任务。
