@@ -11,6 +11,7 @@ Go Server 使用 Rust 实现围棋规则、Monte-Carlo Graph Search（MCGS）和
 - 服务接口支持 19 路、中国规则、半目贴目、落子、悔棋、切换历史位置、持续分析和生成着法。
 - WebSocket JSON 提供会话恢复、搜索快照、候选着法和只读 PV；GTP 可使用标准输入/输出或 TCP。
 - MCGS 支持转置共享、异步在途任务、取消、租约、Worker 断线恢复和每会话图内存预算。
+- 会话可配置固定 PDA（数值及当前行棋方／黑／白参照）和宽根搜索强度；参数由前端调整，通过 `configure_search` 原子生效并回显，默认均关闭。
 - 中国规则对应固定 KataGo 基准的 `chinese` 预设：simple ko、面积计分和长循环无结果。日本规则、摆子、让子及复杂 SGF 导入不在当前服务范围内。
 
 客户端可以根据 [JSON 协议](docs/json_api_v1.md) 自行实现。服务端只提供 API 和 WebSocket，不托管前端静态页面。
@@ -63,7 +64,7 @@ curl http://127.0.0.1:8090/api/workers
 | `--grpc` | `0.0.0.0:50051` | Worker 接入监听地址；上面的启动命令显式限定为本机 |
 | `--model-sha256` | 未指定 | 固定外部 Worker 使用的模型文件 SHA-256 |
 | `--graph-memory-mib` | `32768` | 每会话搜索图的逻辑内存预算（32 GiB），按需增长，非进程 RSS 限额 |
-| `--max-nodes` | `1000000` | 每会话搜索图节点上限，与内存预算分别生效 |
+| `--max-nodes` | `100000000` | 每会话搜索图节点上限，与内存预算分别生效 |
 | `--max-in-flight` | `128` | 每会话在途搜索路径上限 |
 | `--max-sessions` | `4` | 会话数量上限 |
 | `--session-retention-secs` | `120` | 无订阅者时的会话保留时间 |
@@ -72,7 +73,9 @@ curl http://127.0.0.1:8090/api/workers
 | `--gtp` | 关闭 | 启用标准输入/输出 GTP，日志写入 stderr |
 | `--gtp-tcp` | 不监听 | 启用指定地址上的 TCP GTP |
 
-32 GiB 是每个会话独立的搜索图预算，不会在启动时预分配，也不是整个 Server 的共享池或 RSS 硬上限；多个保留会话的预算可以累加。内存或节点上限达到后，搜索会保留结果并报告 `memory_limited`；默认节点上限提高到100万，避免将内存调大后仍被旧10万节点上限提前截断。可以显式传入较小预算，例如 `--graph-memory-mib 512 --max-nodes 100000`。实际生效值见 `/health.configuration.search`，修改启动参数需要重启 Server。
+32 GiB 是每个会话独立的搜索图预算，不会在启动时预分配，也不是整个 Server 的共享池或 RSS 硬上限；多个保留会话的预算可以累加。内存或节点上限达到后，搜索会保留结果并报告 `memory_limited`；默认节点上限为1亿。可以显式传入较小预算，例如 `--graph-memory-mib 512 --max-nodes 100000`。实际生效值见 `/health.configuration.search`，修改启动参数需要重启 Server。
+
+2026-09-22 修复了“约 1.1M visits 后速度归零，但实际内存远未达到 32 GiB”的过度预算计费问题。升级 Server 后保留原 `--graph-memory-mib 32768` 即可，不需要新增开关。计费现在依据实际图数组容量并保留必要的初始化、换根及回收空间；前端显示计费预算和图节点数。只读 `GET /api/sessions` 可查看各会话的停止原因、visits、图节点、在途数和预算，不改变分析状态。详细字段见 [JSON 协议](docs/json_api_v1.md)。
 
 未指定 `--model-sha256` 时，第一个通过握手校验的 Worker 固定该服务进程的模型哈希；Worker 离线不会清除它。更换模型需要重启服务，已有会话不会跨服务重启保存。
 

@@ -39,6 +39,7 @@ impl App {
         Router::new()
             .route("/health", get(health))
             .route("/api/workers", get(workers))
+            .route("/api/sessions", get(sessions))
             .route("/ws", get(upgrade))
             .with_state(self)
     }
@@ -50,6 +51,9 @@ async fn health(State(app): State<App>) -> Json<Value> {
 }
 async fn workers(State(app): State<App>) -> Json<Value> {
     Json(json!({"workers":app.workers.views()}))
+}
+async fn sessions(State(app): State<App>) -> Json<Value> {
+    Json(json!({"sessions":app.sessions.diagnostics()}))
 }
 async fn upgrade(State(app): State<App>, ws: WebSocketUpgrade) -> impl IntoResponse {
     let permit = app.connections.clone().try_acquire_owned();

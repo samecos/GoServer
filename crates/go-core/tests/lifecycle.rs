@@ -36,6 +36,179 @@ fn search() -> Search {
 }
 
 #[test]
+fn pda_reference_sign_and_hash_follow_the_entire_search() {
+    for reference in [PdaPlayer::Root, PdaPlayer::Black, PdaPlayer::White] {
+        for root_color in [Color::Black, Color::White] {
+            for pda in [-1.5, 1.5] {
+                let mut p = Position::new(9, 7.5).unwrap();
+                if root_color == Color::White {
+                    p.play(Move {
+                        color: Color::Black,
+                        point: Some(0),
+                    })
+                    .unwrap();
+                }
+                let tuning = SearchTuning {
+                    playout_doubling_advantage: pda,
+                    playout_doubling_advantage_pla: reference,
+                    ..Default::default()
+                };
+                let mut s = Search::new(
+                    p,
+                    SearchConfig {
+                        tuning,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let root = task(&mut s);
+                let sign = if reference == PdaPlayer::Root
+                    || reference == PdaPlayer::Black && root_color == Color::Black
+                    || reference == PdaPlayer::White && root_color == Color::White
+                {
+                    1.0
+                } else {
+                    -1.0
+                };
+                assert_eq!(root.playout_doubling_advantage, sign * pda);
+                assert_ne!(root.input_hash, root.position.input_hash());
+                s.complete(root.token, evaluation(&root.position)).unwrap();
+                let leaf = task(&mut s);
+                assert_eq!(leaf.playout_doubling_advantage, -sign * pda);
+                s.complete(leaf.token, evaluation(&leaf.position)).unwrap();
+                s.set_root(leaf.position).unwrap();
+                if reference == PdaPlayer::Root {
+                    assert_eq!(
+                        s.root_visits(),
+                        0,
+                        "changed reference must invalidate the retained subtree"
+                    );
+                    assert_eq!(task(&mut s).playout_doubling_advantage, pda);
+                } else {
+                    assert!(s.root_visits() > 0, "fixed reference permits subtree reuse");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn tuning_change_cancels_inflight_clears_graph_and_preserves_task_identity() {
+    let mut s = search();
+    let root = task(&mut s);
+    assert_eq!(root.input_hash, root.position.input_hash());
+    s.complete(root.token, evaluation(&root.position)).unwrap();
+    let old = task(&mut s);
+    let tuning = SearchTuning {
+        playout_doubling_advantage: 1.0,
+        wide_root_noise: 0.04,
+        ..Default::default()
+    };
+    let before = s.snapshot(10, 3);
+    assert!(s
+        .set_tuning(SearchTuning {
+            wide_root_noise: -1.0,
+            ..tuning
+        })
+        .is_err());
+    assert_eq!(s.snapshot(10, 3).version, before.version);
+    assert_eq!(s.in_flight(), 1);
+    assert_eq!(s.set_tuning(tuning).unwrap(), vec![old.token]);
+    assert_eq!(s.root_visits(), 0);
+    assert_eq!(s.in_flight(), 0);
+    assert_eq!(
+        s.complete(old.token, evaluation(&old.position)).unwrap(),
+        Completion::Stale
+    );
+    let new = task(&mut s);
+    assert!(new.token.id > old.token.id);
+    assert!(new.token.generation > old.token.generation);
+    assert_ne!(new.input_hash, root.input_hash);
+    s.complete(new.token, evaluation(&new.position)).unwrap();
+    assert!(s.set_tuning(tuning).unwrap().is_empty());
+    assert_eq!(s.root_visits(), 1, "no-op must retain results");
+    s.set_tuning(SearchTuning::default()).unwrap();
+    let restored = task(&mut s);
+    assert_eq!(restored.input_hash, root.input_hash);
+    assert_eq!(restored.playout_doubling_advantage, 0.0);
+}
+
+#[test]
+fn equivalent_pda_and_wide_changes_retain_statistics_but_invalidate_old_tasks() {
+    for root_color in [Color::Black, Color::White] {
+        let mut p = Position::new(19, 7.5).unwrap();
+        if root_color == Color::White {
+            p.play(Move {
+                color: Color::Black,
+                point: Some(0),
+            })
+            .unwrap();
+        }
+        let mut s = Search::new(
+            p,
+            SearchConfig {
+                tuning: SearchTuning {
+                    playout_doubling_advantage: 0.5,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let root = task(&mut s);
+        s.complete(root.token, evaluation(&root.position)).unwrap();
+        let child = task(&mut s);
+        s.complete(child.token, evaluation(&child.position))
+            .unwrap();
+        let outstanding = task(&mut s);
+        let before = s.snapshot(362, 8);
+        let fixed = SearchTuning {
+            playout_doubling_advantage: 0.5,
+            playout_doubling_advantage_pla: if root_color == Color::Black {
+                PdaPlayer::Black
+            } else {
+                PdaPlayer::White
+            },
+            wide_root_noise: 0.04,
+        };
+        assert_eq!(s.set_tuning(fixed).unwrap(), vec![outstanding.token]);
+        assert_eq!(
+            s.complete(outstanding.token, evaluation(&outstanding.position))
+                .unwrap(),
+            Completion::Stale
+        );
+        let after = s.snapshot(362, 8);
+        assert_eq!(after.root, before.root);
+        assert_eq!(after.nodes, before.nodes);
+        assert_eq!(after.root_change.as_ref().unwrap().reuse_reason, "reused");
+        for (a, b) in after.candidates.iter().zip(&before.candidates) {
+            assert_eq!(
+                (a.mv, a.prior, a.visits, a.stats),
+                (b.mv, b.prior, b.visits, b.stats)
+            );
+        }
+        s.set_tuning(SearchTuning {
+            wide_root_noise: 0.2,
+            ..fixed
+        })
+        .unwrap();
+        assert_eq!(s.snapshot(1, 1).root, before.root);
+        s.set_root(child.position).unwrap();
+        assert!(s.root_visits() > 0);
+        s.set_tuning(SearchTuning {
+            playout_doubling_advantage: 1.0,
+            ..fixed
+        })
+        .unwrap();
+        assert_eq!(s.root_visits(), 0);
+        assert_eq!(
+            s.snapshot(1, 1).root_change.unwrap().reuse_reason,
+            "pda_changed"
+        );
+    }
+}
+
+#[test]
 fn single_initializer_duplicate_late_and_retry() {
     let mut s = search();
     let r = task(&mut s);

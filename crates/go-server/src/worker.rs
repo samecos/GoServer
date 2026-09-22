@@ -445,7 +445,7 @@ impl WorkerPool {
                 policy_temperature: 1.0,
                 policy_optimism: 0.0,
                 draw_equivalent_wins_for_white: 0.5,
-                playout_doubling_advantage: 0.0,
+                playout_doubling_advantage: request.playout_doubling_advantage,
                 include_ownership: false,
                 max_history: 1000,
                 conservative_pass: false,

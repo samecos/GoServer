@@ -1,7 +1,7 @@
 use crate::worker::{Outcome, WorkerPool};
 use go_core::{
     Color, Completion, Evaluation, EvaluationRequest, Move, Position, Search, SearchConfig,
-    SearchStep,
+    SearchStep, SearchTuning,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -217,6 +217,29 @@ impl Sessions {
     }
     pub fn count(&self) -> usize {
         self.handles.lock().unwrap().len()
+    }
+    /// Read the latest published diagnostics without subscribing, waking the
+    /// search actor, changing analysis intent, or traversing its graph.
+    pub fn diagnostics(&self) -> Vec<Value> {
+        self.handles
+            .lock()
+            .unwrap()
+            .values()
+            .filter_map(|h| {
+                if h.snapshot.has_changed().is_err() {
+                    return None;
+                }
+                let s = h.snapshot.borrow();
+                let a = &s["analysis"];
+                Some(
+                    json!({"sessionId":h.id,"generation":s["generation"],"position":s["position"],
+                "enabled":a["enabled"],"status":a["status"],"reason":a["reason"],
+                "visits":a["visits"],"nodesPerSecond":a["nodesPerSecond"],
+                "graphNodes":a["graphNodes"],"memoryBytes":a["memoryBytes"],
+                "inFlight":a["inFlight"],"limits":a["limits"],"reclamation":a["reclamation"]}),
+                )
+            })
+            .collect()
     }
     pub fn configuration(&self) -> Value {
         json!({
@@ -597,6 +620,32 @@ impl Actor {
         }
         match r.get("type").and_then(Value::as_str).unwrap_or("") {
             "snapshot" => Ok(self.publish()),
+            "configure_search" => {
+                let patch = r
+                    .get("search")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| ApiError::invalid("search must be an object"))?;
+                let mut value = serde_json::to_value(self.search.config().tuning).unwrap();
+                value.as_object_mut().unwrap().extend(patch.clone());
+                let tuning: SearchTuning =
+                    serde_json::from_value(value).map_err(ApiError::invalid)?;
+                tuning.validate().map_err(ApiError::invalid)?;
+                if tuning == self.search.config().tuning {
+                    return Ok(self.publish());
+                }
+                self.search.set_tuning(tuning).map_err(ApiError::invalid)?;
+                self.cancel_genmove("search settings changed");
+                self.stop_tasks();
+                self.budget = None;
+                self.generation += 1;
+                self.last_visits = self.search.root_visits();
+                self.last_rate = Instant::now();
+                self.rate = 0.0;
+                self.retry_after = Instant::now();
+                self.status = if self.enabled { "analyzing" } else { "idle" }.into();
+                self.reason = None;
+                Ok(self.publish())
+            }
             "analyze" => {
                 let enabled = r
                     .get("enabled")
@@ -875,9 +924,22 @@ impl Actor {
                     // a permanent stop or cancel a genmove while it can recover.
                     if self.search.in_flight() == 0 {
                         self.status = "memory_limited".into();
+                        let snapshot = self.search.snapshot(0, 0);
                         self.reason = Some(
-                            "search graph capacity reached; change position or increase the graph budget to continue".into(),
+                            if snapshot.nodes >= self.search.config().max_nodes {
+                                "configured search node budget reached"
+                            } else {
+                                "configured search memory budget reached"
+                            }
+                            .into(),
                         );
+                        self.rate = 0.0;
+                        tracing::info!(session = %self.id, reason = ?self.reason,
+                            visits = snapshot.root.visits, graph_nodes = snapshot.nodes,
+                            charged_bytes = snapshot.memory_bytes,
+                            max_memory_bytes = self.search.config().max_memory_bytes,
+                            max_nodes = self.search.config().max_nodes,
+                            "search capacity reached");
                         if self.pending.is_some() {
                             self.finish_budget();
                         } else {
@@ -893,6 +955,7 @@ impl Actor {
                     if self.search.in_flight() == 0 {
                         self.status = "memory_limited".into();
                         self.reason = Some("configured search depth budget reached".into());
+                        self.rate = 0.0;
                         if self.pending.is_some() {
                             self.finish_budget();
                         } else {
@@ -979,6 +1042,9 @@ impl Actor {
             self.last_visits = ss.root.visits;
             self.last_rate = Instant::now();
         }
+        if self.status == "memory_limited" {
+            self.rate = 0.0;
+        }
         let root = if ss.root.visits > 0 {
             json!({"winRateBlack":((1.0-ss.root.win_loss_value)/2.0).clamp(0.0,1.0),"scoreLeadBlack":-ss.root.score_mean})
         } else {
@@ -1001,8 +1067,9 @@ impl Actor {
         self.version += 1;
         let value = json!({"type":"snapshot","sessionId":self.id,"generation":self.generation,"version":self.version,"boardSize":19,"board":p.board(),
             "moves":self.line.iter().copied().map(move_json).collect::<Vec<_>>(),"position":self.cursor,"toPlay":p.to_move().stone(),"captures":captures,
-            "settings":{"komi":self.komi,"rules":"chinese"},"terminal":p.terminal(),"analysis":{"enabled":self.enabled,"status":self.status,"reason":self.reason,"root":root,"candidates":candidates,
+            "settings":{"komi":self.komi,"rules":"chinese","search":self.search.config().tuning},"terminal":p.terminal(),"analysis":{"enabled":self.enabled,"status":self.status,"reason":self.reason,"root":root,"candidates":candidates,
                 "visits":ss.root.visits,"nodesPerSecond":self.rate,"graphNodes":ss.nodes,"memoryBytes":ss.memory_bytes,"inFlight":ss.in_flight,
+                "limits":{"maxMemoryBytes":self.search.config().max_memory_bytes,"maxNodes":self.search.config().max_nodes,"maxDepth":self.search.config().max_depth},
                 "reclamation":ss.reclamation,"rootChange":ss.root_change,
                 "evaluationsCompleted":ss.evaluations_completed,"transpositionHits":ss.transposition_hits,"catchUpVisits":ss.catch_up_visits},"workers":self.pool.snapshot_views()});
         #[cfg(feature = "search-profiling")]

@@ -9,13 +9,21 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::time::Instant;
 use thiserror::Error;
 
+mod memory;
 mod reclamation;
 mod scoring;
+mod tuning;
 pub use reclamation::ReclamationSnapshot;
 use reclamation::{Reclaimer, RetiredGraph};
+use tuning::RootNoise;
+pub use tuning::{PdaPlayer, SearchTuning};
 
 #[cfg(test)]
+mod memory_tests;
+#[cfg(test)]
 mod root_collection_tests;
+#[cfg(test)]
+mod tuning_tests;
 
 /// Deterministic KataGo-compatible parameter profile. Optional neural uncertainty
 /// weighting uses the evaluator's short-term error outputs. Dynamic score utility,
@@ -23,6 +31,7 @@ mod root_collection_tests;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SearchConfig {
+    pub tuning: SearchTuning,
     pub simd: SearchSimd,
     pub max_nodes: usize,
     pub max_memory_bytes: usize,
@@ -124,6 +133,7 @@ mod tests {
         n.raw = Some(stats(1, q, 1.0));
         let id = s.nodes.len();
         s.nodes.push(n);
+        s.recount_payload();
         id
     }
     fn link(s: &mut Search, parent: usize, child: usize, visits: u64, point: u16) {
@@ -137,6 +147,7 @@ mod tests {
         });
         s.nodes[parent].set_child(edge, child);
         s.nodes[child].parents.insert(parent);
+        s.recount_payload();
     }
 
     #[test]
@@ -484,8 +495,11 @@ mod tests {
                 .sum();
             assert_eq!(s.pending_memory_bytes, pending);
             assert_eq!(
-                s.memory_bytes(),
-                s.nodes.len() * s.node_charge() + s.position_charge(&s.position) + pending
+                s.graph_payload_bytes,
+                s.nodes
+                    .iter()
+                    .map(|n| n.heap_charge(s.position.board().len()))
+                    .sum::<usize>()
             );
         };
         let mut tasks = Vec::new();
@@ -616,6 +630,7 @@ mod tests {
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
+            tuning: SearchTuning::default(),
             simd: SearchSimd::Auto,
             max_nodes: 100_000_000,
             max_memory_bytes: 32 * 1024 * 1024 * 1024,
@@ -650,6 +665,7 @@ pub struct EvaluationRequest {
     pub position: Position,
     pub allow_terminal_search_history: bool,
     pub force_non_terminal: bool,
+    pub playout_doubling_advantage: f64,
 }
 #[derive(Clone, Debug)]
 // Return the owned replay without an extra allocation on every scheduled leaf.
@@ -715,6 +731,10 @@ pub struct RootChangeMetrics {
     pub generation: u64,
     pub old_nodes: usize,
     pub retained_nodes: usize,
+    #[serde(default)]
+    pub retained_visits: u64,
+    #[serde(default)]
+    pub reuse_reason: String,
     pub cancel_ms: f64,
     pub mark_ms: f64,
     pub compact_ms: f64,
@@ -858,6 +878,7 @@ struct Pending {
 /// avoid its leaf and can continue down independent paths.
 pub struct Search {
     config: SearchConfig,
+    root_noise: RootNoise,
     simd: SearchSimd,
     selection_scratch: Option<Box<scoring::Prepared>>,
     position: Position,
@@ -866,6 +887,9 @@ pub struct Search {
     root: usize,
     pending: HashMap<EvalToken, Pending>,
     pending_memory_bytes: usize,
+    // Cached heap capacities plus reserved NN completion storage. Updated only
+    // at allocation sites; budget checks never scan the growing graph.
+    graph_payload_bytes: usize,
     recompute_scratch: Vec<(NodeStats, f64)>,
     generation: u64,
     next_id: u64,
@@ -880,6 +904,7 @@ pub struct Search {
 }
 impl Search {
     pub fn new(position: Position, config: SearchConfig) -> Result<Self, SearchError> {
+        config.tuning.validate()?;
         if config.max_nodes == 0
             || config.max_in_flight == 0
             || config.max_depth == 0
@@ -916,8 +941,10 @@ impl Search {
         }
         let key = position.graph_key();
         let node = Node::new(&position);
+        let graph_payload_bytes = node.heap_charge(position.board().len());
         let simd = config.simd.resolve().map_err(SearchError::Config)?;
         let s = Self {
+            root_noise: RootNoise::new(u64::from_le_bytes(key[..8].try_into().unwrap())),
             simd,
             selection_scratch: (simd != SearchSimd::Scalar).then(Box::default),
             config,
@@ -927,6 +954,7 @@ impl Search {
             root: 0,
             pending: HashMap::new(),
             pending_memory_bytes: 0,
+            graph_payload_bytes,
             recompute_scratch: Vec::new(),
             generation: 1,
             next_id: 1,
@@ -949,6 +977,22 @@ impl Search {
     }
     pub fn config(&self) -> &SearchConfig {
         &self.config
+    }
+
+    /// Preserve the graph whenever NN inputs remain equivalent. Root selection
+    /// noise does not invalidate NN values. Changed PDA inputs require a reset.
+    /// Both paths invalidate old task tokens while retaining monotonic IDs.
+    pub fn set_tuning(&mut self, tuning: SearchTuning) -> Result<Vec<EvalToken>, SearchError> {
+        tuning.validate()?;
+        if tuning == self.config.tuning {
+            return Ok(Vec::new());
+        }
+        let root = self.position.to_move();
+        let reset = self.config.tuning.effective_pda(root, Color::Black)
+            != tuning.effective_pda(root, Color::Black);
+        let canceled = self.set_root_inner(self.position.clone(), reset)?;
+        self.config.tuning = tuning;
+        Ok(canceled)
     }
     pub fn simd_backend(&self) -> SearchSimd {
         self.simd
@@ -973,14 +1017,11 @@ impl Search {
         }
     }
 
-    // Charge all potential edge slots (including unallocated slots), reverse
-    // links, ownership and table overhead. Pending replay histories have their
-    // own budget. This deliberately overestimates logical live storage.
+    // Reserve a new node's initialization before issuing NN work. Existing
+    // nodes use their actual heap capacities instead of a full-board allowance
+    // for reverse links at every node (formerly about 38 KB/node on 19x19).
     fn node_charge(&self) -> usize {
-        self.node_payload_charge() + Self::collection_reserve_per_node()
-    }
-    fn node_payload_charge(&self) -> usize {
-        512 + self.position.board().len() * (std::mem::size_of::<Edge>() + 64)
+        Self::node_structure_charge() + Node::initial_heap_charge(self.position.board().len())
     }
     // Reserve temporary compaction storage as the graph grows, so a full tree
     // still has room for the dense mark/remap/stack, new node Vec and new index.
@@ -998,7 +1039,10 @@ impl Search {
     }
 
     fn active_memory_bytes(&self) -> usize {
-        self.nodes.len().saturating_mul(self.node_charge())
+        self.nodes
+            .len()
+            .saturating_mul(Self::node_structure_charge())
+            + self.graph_payload_bytes
             + self.position_charge(&self.position)
             + self.pending_memory_bytes
     }
@@ -1123,9 +1167,22 @@ impl Search {
                 self.next_id += 1;
                 self.nodes[node].state = State::Evaluating(token);
                 self.reserve_path(node, path, true);
+                let playout_doubling_advantage = self
+                    .config
+                    .tuning
+                    .effective_pda(self.position.to_move(), position.to_move());
+                let mut input_hash = position.input_hash();
+                if playout_doubling_advantage != 0.0 {
+                    let mut hash = Sha256::new();
+                    hash.update(b"go-eval-pda-v1");
+                    hash.update(input_hash);
+                    hash.update(playout_doubling_advantage.to_le_bytes());
+                    input_hash = hash.finalize().into();
+                }
                 let request = EvaluationRequest {
                     token,
-                    input_hash: position.input_hash(),
+                    input_hash,
+                    playout_doubling_advantage,
                     position: position.clone(),
                     allow_terminal_search_history: position.has_post_terminal_play(),
                     force_non_terminal: self.nodes[node].force_non_terminal,
@@ -1192,6 +1249,16 @@ impl Search {
                         let _timer = Span::new(Stage::GraphLookup);
                         self.index.get(&key).copied()
                     };
+                    let link_charge = self.link_growth_charge(node, edge_idx, cached);
+                    if self.memory_bytes().saturating_add(link_charge)
+                        > self.config.max_memory_bytes
+                    {
+                        limited.0 = true;
+                        if self.pending.is_empty() {
+                            return Some(SearchStep::MemoryLimited);
+                        }
+                        continue;
+                    }
                     let child = if let Some(c) = cached {
                         self.transposition_hits += 1;
                         c
@@ -1209,6 +1276,7 @@ impl Search {
                             || self
                                 .memory_bytes()
                                 .saturating_add(self.node_charge())
+                                .saturating_add(link_charge)
                                 .saturating_add(replay_charge)
                                 > self.config.max_memory_bytes
                         {
@@ -1225,12 +1293,13 @@ impl Search {
                         let mut child_node = Node::new(&child_position);
                         child_node.key = key;
                         child_node.force_non_terminal = force_non_terminal;
+                        self.graph_payload_bytes +=
+                            child_node.heap_charge(self.position.board().len());
                         self.nodes.push(child_node);
                         self.index.insert(key, c);
                         c
                     };
-                    self.nodes[node].set_child(edge_idx, child);
-                    self.nodes[child].parents.insert(node);
+                    self.attach_child(node, edge_idx, child);
                     child
                 }
             };
@@ -1275,7 +1344,14 @@ impl Search {
     fn ordered_edges(&mut self, node: usize) -> EdgeOrder {
         let _timer = Span::new(Stage::Selection);
         let n = &self.nodes[node];
-        if self.simd != SearchSimd::Scalar {
+        let wide = if node == self.root {
+            self.config.tuning.wide_root_noise
+        } else {
+            0.0
+        };
+        // The optional random adjustment is confined to root selection. Deeper
+        // nodes and the default zero profile retain the existing SIMD path.
+        if self.simd != SearchSimd::Scalar && wide == 0.0 {
             return scoring::prepared_scores(
                 self.simd,
                 n,
@@ -1324,9 +1400,17 @@ impl Search {
                         (loss - utility) * virtual_weight / (virtual_weight + weight.max(0.25));
                     weight += virtual_weight;
                 }
+                let mut prior = e.prior;
+                if wide > 0.0 {
+                    // KataGo's wideRootNoise: flatten the prior without
+                    // renormalizing, then add a 50% half-normal utility bonus.
+                    // Apply after virtual losses, never to stored NN statistics.
+                    prior = prior.powf(1.0 / (4.0 * wide + 1.0));
+                    utility += n.color.white_sign() * self.root_noise.bonus(wide);
+                }
                 ScoredEdge {
                     index: i,
-                    score: n.color.white_sign() * utility + scale * e.prior / (1.0 + weight),
+                    score: n.color.white_sign() * utility + scale * prior / (1.0 + weight),
                 }
             })
             .collect();
@@ -1385,12 +1469,17 @@ impl Search {
                 in_flight: 0,
             })
             .collect();
+        let previous_charge = self.nodes[p.node].heap_charge(area);
         self.nodes[p.node].raw = Some(raw);
         self.nodes[p.node].stats = raw;
         self.nodes[p.node].state = State::Expanded;
         self.nodes[p.node].edges = edges;
         self.nodes[p.node].linked_edges.clear();
-        self.nodes[p.node].ownership = evaluation.ownership;
+        // The protocol bounds length, not Vec capacity. Normalize a caller's
+        // oversized buffer so completion cannot consume unreserved storage.
+        self.nodes[p.node].ownership = evaluation.ownership.into_boxed_slice().into_vec();
+        self.graph_payload_bytes =
+            self.graph_payload_bytes - previous_charge + self.nodes[p.node].heap_charge(area);
         self.reserve_path(p.node, &p.path, false);
         // Finish the leaf's idempotent normalization before updating its parents.
         // On an unshared chain, commit_path then updates every ancestor already.
@@ -1556,10 +1645,13 @@ impl Search {
             ownership: Vec::new(),
         };
         let raw = self.raw_stats(&e);
+        let area = self.position.board().len();
+        let previous_charge = self.nodes[node].heap_charge(area);
         let n = &mut self.nodes[node];
         n.raw = Some(raw);
         n.stats = raw;
         n.state = State::Terminal;
+        self.graph_payload_bytes = self.graph_payload_bytes - previous_charge + n.heap_charge(area);
     }
 
     /// The MCGS invariant: recompute from CURRENT shared child values, using this
@@ -1690,10 +1782,17 @@ impl Search {
     /// Reuses reachable nodes only when board size/komi/context match. The caller
     /// must create a fresh Search for a different model/evaluation profile.
     pub fn set_root(&mut self, position: Position) -> Result<Vec<EvalToken>, SearchError> {
+        self.set_root_inner(position, false)
+    }
+
+    fn set_root_inner(
+        &mut self,
+        position: Position,
+        reset: bool,
+    ) -> Result<Vec<EvalToken>, SearchError> {
         let started = Instant::now();
-        let minimum_charge = 512
-            + position.board().len() * (std::mem::size_of::<Edge>() + 64)
-            + Self::collection_reserve_per_node()
+        let minimum_charge = Self::node_structure_charge()
+            + Node::initial_heap_charge(position.board().len())
             + self.position_charge(&position);
         if minimum_charge > self.config.max_memory_bytes {
             return Err(SearchError::RootBudget);
@@ -1708,44 +1807,72 @@ impl Search {
             ..RootChangeMetrics::default()
         });
         self.root_changed_at = Some(started);
-        let compatible = position.board_size() == self.position.board_size()
+        let same_context = position.board_size() == self.position.board_size()
             && position.komi() == self.position.komi();
+        let pda_reference_changed = self.config.tuning.playout_doubling_advantage != 0.0
+            && self.config.tuning.playout_doubling_advantage_pla == PdaPlayer::Root
+            && position.to_move() != self.position.to_move();
+        let compatible = !reset && same_context && !pda_reference_changed;
         let existing = if compatible {
             self.index.get(&position.graph_key()).copied()
         } else {
             None
+        };
+        let mut reuse_reason = if reset {
+            "pda_changed"
+        } else if !same_context {
+            "position_context_changed"
+        } else if pda_reference_changed {
+            "pda_reference_changed"
+        } else if existing.is_some() {
+            "reused"
+        } else {
+            "position_not_searched"
         };
         self.position = position;
         if let Some(root) = existing {
             self.root = root;
             self.collect_unreachable();
         } else {
+            let old_payload = std::mem::replace(
+                &mut self.graph_payload_bytes,
+                Node::initial_heap_charge(self.position.board().len()),
+            );
             let old_nodes = std::mem::replace(&mut self.nodes, vec![Node::new(&self.position)]);
             self.root = 0;
             let old_index = std::mem::replace(
                 &mut self.index,
                 HashMap::from([(self.position.graph_key(), 0)]),
             );
-            self.retire_graph(old_nodes, old_index);
+            self.retire_graph(old_nodes, old_index, old_payload);
         }
         self.version += 1;
         if self.active_memory_bytes() > self.config.max_memory_bytes {
+            reuse_reason = "memory_budget";
             // A longer root replay can leave insufficient budget for the old
             // subtree. Keep the valid root NN value and safely reclaim children.
             let mut root = self.nodes.swap_remove(self.root);
-            root.edges.clear();
-            root.linked_edges.clear();
-            root.parents.clear();
+            let old_payload =
+                self.graph_payload_bytes - root.heap_charge(self.position.board().len());
+            // clear() retains allocation capacity, which can still exceed the
+            // reduced budget (especially for a heavily shared root).
+            root.edges = Vec::new();
+            root.linked_edges = Vec::new();
+            root.parents = HashSet::new();
+            if root.state != State::Terminal {
+                root.state = State::Unevaluated;
+            }
             if let Some(raw) = root.raw {
                 root.stats = raw;
             }
+            self.graph_payload_bytes = root.heap_charge(self.position.board().len());
             let old_nodes = std::mem::replace(&mut self.nodes, vec![root]);
             self.root = 0;
             let old_index = std::mem::replace(
                 &mut self.index,
                 HashMap::from([(self.position.graph_key(), 0)]),
             );
-            self.retire_graph(old_nodes, old_index);
+            self.retire_graph(old_nodes, old_index, old_payload);
         }
         let change = self.root_change.as_mut().unwrap();
         change.retained_nodes = if existing.is_some() {
@@ -1753,20 +1880,23 @@ impl Search {
         } else {
             0
         };
+        change.retained_visits = if existing.is_some() {
+            self.nodes[self.root].stats.visits
+        } else {
+            0
+        };
+        change.reuse_reason = reuse_reason.into();
         change.total_ms = started.elapsed().as_secs_f64() * 1000.0;
         Ok(canceled)
     }
 
-    fn retire_graph(&mut self, nodes: Vec<Node>, index: HashMap<Key, usize>) {
+    fn retire_graph(&mut self, nodes: Vec<Node>, index: HashMap<Key, usize>, payload: usize) {
         let start = Instant::now();
         // Node charge covers payload; separately charge the old Vec's unused
         // capacity and the detached hash table until the entire batch is gone.
-        let bytes = nodes
-            .len()
-            .saturating_mul(self.node_payload_charge())
-            .saturating_add(
-                (nodes.capacity() - nodes.len()).saturating_mul(std::mem::size_of::<Node>()),
-            )
+        let bytes = payload
+            .saturating_add(nodes.len().saturating_mul(128))
+            .saturating_add(nodes.capacity().saturating_mul(std::mem::size_of::<Node>()))
             .saturating_add(index.capacity().saturating_mul(64));
         self.reclaimer.retire(
             RetiredGraph {
@@ -1822,10 +1952,13 @@ impl Search {
         }
         let start = Instant::now();
         let mut nodes = Vec::with_capacity(kept);
+        let area = self.position.board().len();
+        let mut retired_payload = self.graph_payload_bytes;
         // Removing in descending old-ID order leaves every earlier slot in
         // place. Only live nodes move; dead payloads stay in the old allocation.
         for old in (0..remap.len()).rev() {
             if remap[old] != UNSEEN {
+                retired_payload -= self.nodes[old].heap_charge(area);
                 nodes.push(self.nodes.swap_remove(old));
             }
         }
@@ -1861,16 +1994,24 @@ impl Search {
         }
         let start = Instant::now();
         self.root = remap[self.root];
+        self.graph_payload_bytes = 0;
         let old_index = std::mem::replace(
             &mut self.index,
-            nodes.iter().enumerate().map(|(i, n)| (n.key, i)).collect(),
+            nodes
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    self.graph_payload_bytes += n.heap_charge(area);
+                    (n.key, i)
+                })
+                .collect(),
         );
         let old_nodes = std::mem::replace(&mut self.nodes, nodes);
         if let Some(change) = &mut self.root_change {
             change.index_ms = start.elapsed().as_secs_f64() * 1000.0;
             change.workspace_bytes += self.index.capacity() * 64;
         }
-        self.retire_graph(old_nodes, old_index);
+        self.retire_graph(old_nodes, old_index, retired_payload);
     }
     pub fn snapshot(&self, limit: usize, pv_len: usize) -> SearchSnapshot {
         let _timer = Span::new(Stage::Snapshot);

@@ -31,10 +31,14 @@
 | 转置追赶 | `maybeCatchUpEdgeVisits`，leak=0；父边可使用共享节点的既有访问量，无需新评估 |
 | 路径内循环和终局 | 循环停止下探；真终局直接规则求值；整数终局目差的 mean-square 含 draw=0.5 对应的 0.25 格点项 |
 | 候选与 PV | 按父边有效权重排序；PV 和 variation 只读取既有图 |
+| 可选固定 PDA | `SearchTuning` 的参照方为 root/black/white；叶子按 next-player 转换正负；非零 PDA 绑定输入身份，改变评估参照时清图 |
+| 可选宽根探索 | `wideRootNoise` 的先验幂变换与 50% 半正态效用奖励；仅根选边，virtual loss 之后，不写入统计；独立 SplitMix64/Box-Muller 流 |
 
 明确参考配置为：`useGraphSearch=true`、`graphSearchRepBound=11`、`graphSearchCatchUpLeakProb=0`；win/loss utility=1、no-result utility=0、draw=0.5；PUCT exploration=1、log=0、FPU reduction=0.2；value weight exponent=0.5；static score utility=0.3、dynamic score utility=0。root noise、noise pruning、subtree bias、eval cache、human-SL、mirror/passing hacks、LCB、root symmetry pruning 等可选功能未启用。此范围不等于完整复现 KataGo 默认生产配置。
 
 本实现调整了执行流程：评估占用前移；异步等待期间尝试其他可执行边；结果到达后刷新受影响祖先；按节点数、内存预算、在途数和深度限制扩展。上游图身份本身使用有界历史启发式，本实现仍沿实际路径验证合法性与终局。分布式完成顺序可能改变搜索轨迹，不保证逐步等同上游多线程搜索。
+
+上述固定对照 profile 仍默认关闭 PDA 与宽根搜索；`SearchConfig.tuning` 可显式启用。`Search::set_tuning` 验证有限范围，取消旧任务但保持单调身份与后台回收器；仅实际 NN PDA 条件改变才丢弃旧图，宽根或等效固定参照方变化保留统计。PDA 的 root 参照在行棋方变化时禁止旧树复用，固定黑／白方则允许继承。前端首次开启默认固定当前颜色，显式 root 模式标注换方重算。宽根开启时只有根部退回标量评分，深层评分路径不变；采样流独立于 C++，不以既有无噪声逐轨迹对照宣称有噪声搜索等价。
 
 ## 资源与验证边界
 
@@ -57,7 +61,9 @@ SIMD 处理相互独立的候选，仍使用精确除法、独立乘加及原 `t
 
 `SEARCH_BENCH_SIMD=scalar|auto|avx512` 选择基准内核，JSON 的 `simdBackend` 报告实际路径。工程收益应使用包含整理数据和搜索回传的完整 ABBA，而不是仅比较向量算术循环。测试覆盖浮点位级一致性、稀疏/共享子节点、候选尾部、完整同分顺序和工作区重复使用。AVX2 候选未通过本轮全部性能采用门，没有保留为发布选项。
 
-图预算计入节点最大出边、逆向父引用、所有权、哈希表及在途历史等逻辑存储。`memory_bytes` 不等于进程 RSS；allocator、网络、临时遍历和数值缓存另有开销。预算不足时停止扩展；切根先取消任务，再回收不可达节点。
+图预算按已分配的出边、稀疏子边索引、逆向父引用、所有权数组容量累计计费；节点容器、哈希表和换根整理另留保守空间。未完成 NN 初始化的节点提前预留完整 policy/ownership 容量，完成后释放未使用部分；在途历史、待回收图仍计入。普通预算查询为 O(1)，不逐次扫描整图。`memory_bytes` 仍不等于进程 RSS；网络、临时遍历和数值缓存另有开销。预算不足时停止扩展；切根先取消任务，再回收不可达节点。
+
+2026-09-22 修正旧版固定约 38,920 字节/19 路节点的过度计费。旧 32 GiB 预算约在 882,829 个图节点触发，可能表现为约 1.1M visits 时停止而实际进程内存尚不足 32 GiB。新版不再为每个节点预留整盘规模的逆向父引用；容量增长、异步完成、失败、换根和后台释放保持同一计费口径。限制仍有效，并不承诺固定访问量上限或占满操作系统显示的 32 GiB。
 
 在途历史预算通过等价累计计费维护，失败/取消/完成只在真正移除任务时释放；无效回包不会提前释放。节点重算复用单写者的临时数组，保留原子节点顺序与浮点公式。当前局面的 situational SHA-256 直接读取已有劫历史末项，落子后仍按原字节格式计算一次；输入身份 Hash、图身份与 pass/循环语义不变。
 

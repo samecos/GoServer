@@ -233,6 +233,227 @@ fn result(r: w::EvalRequest) -> w::WorkerMessage {
 }
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+#[tokio::test]
+async fn search_settings_are_atomic_session_scoped_and_restored() {
+    let h = Harness::new().await;
+    let (mut ws, _) = connect_async(&h.http).await.unwrap();
+    let open = request(&mut ws, json!({"id":"open","type":"open"})).await;
+    let defaults = json!({"playoutDoublingAdvantage":0.0,"playoutDoublingAdvantagePla":"root","wideRootNoise":0.0});
+    assert_eq!(open["data"]["settings"]["search"], defaults);
+    let sid = open["data"]["sessionId"].clone();
+    let change = request(&mut ws, json!({"id":"set","type":"configure_search","search":{"playoutDoublingAdvantage":-1.5,"playoutDoublingAdvantagePla":"white","wideRootNoise":0.04}})).await;
+    assert_eq!(change["ok"], true, "{change}");
+    let settings = change["data"]["settings"]["search"].clone();
+    let generation = change["data"]["generation"].clone();
+    for patch in [
+        json!({"playoutDoublingAdvantage":3.1}),
+        json!({"wideRootNoise":-0.1}),
+        json!({"wideRootNoise":5.1}),
+        json!({"wideRootNoise":null}),
+        json!({"wideRootNoise":"0.1"}),
+        json!({"playoutDoublingAdvantagePla":"blue"}),
+        json!({"wideRootNoize":0.1}),
+        json!(false),
+    ] {
+        let bad = request(
+            &mut ws,
+            json!({"id":"bad","type":"configure_search","search":patch}),
+        )
+        .await;
+        assert_eq!(bad["error"]["code"], "INVALID_REQUEST", "{bad}");
+        let current = request(&mut ws, json!({"id":"snapshot","type":"snapshot"})).await;
+        assert_eq!(current["data"]["settings"]["search"], settings);
+        assert_eq!(current["data"]["generation"], generation);
+    }
+    let noop = request(
+        &mut ws,
+        json!({"id":"noop","type":"configure_search","search":settings}),
+    )
+    .await;
+    assert_eq!(noop["data"]["generation"], generation);
+    let partial = request(
+        &mut ws,
+        json!({"id":"partial","type":"configure_search","search":{"wideRootNoise":0.08}}),
+    )
+    .await;
+    assert_eq!(
+        partial["data"]["settings"]["search"]["playoutDoublingAdvantage"],
+        -1.5
+    );
+    let stale = request(
+        &mut ws,
+        json!({"id":"stale","type":"configure_search","generation":generation,"search":defaults}),
+    )
+    .await;
+    assert_eq!(stale["error"]["code"], "STALE_GENERATION");
+    let (mut other, _) = connect_async(&h.http).await.unwrap();
+    let other_open = request(&mut other, json!({"id":"other","type":"open"})).await;
+    assert_eq!(other_open["data"]["settings"]["search"], defaults);
+    let resumed = request(
+        &mut other,
+        json!({"id":"attach","type":"open","sessionId":sid}),
+    )
+    .await;
+    assert_eq!(
+        resumed["data"]["settings"]["search"],
+        partial["data"]["settings"]["search"]
+    );
+    let reset = request(
+        &mut other,
+        json!({"id":"reset","type":"configure_search","search":defaults}),
+    )
+    .await;
+    let shared = request(&mut ws, json!({"id":"shared","type":"snapshot"})).await;
+    assert_eq!(shared["data"]["settings"], reset["data"]["settings"]);
+}
+
+#[tokio::test]
+async fn configured_pda_reaches_worker_leaves_and_late_replies_cannot_restore_old_values() {
+    let config = SessionConfig {
+        search: go_core::SearchConfig {
+            max_in_flight: 1,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let h = Harness::configured_with_lease(config, Duration::from_secs(5)).await;
+    let (tx, mut worker) = h.worker("pda").await;
+    let (mut ws, _) = connect_async(&h.http).await.unwrap();
+    request(&mut ws, json!({"id":"o","type":"open"})).await;
+    request(&mut ws, json!({"id":"c","type":"configure_search","search":{"playoutDoublingAdvantage":1.5,"wideRootNoise":0.04}})).await;
+    request(&mut ws, json!({"id":"a","type":"analyze","enabled":true})).await;
+    let root = next_eval(&mut worker).await;
+    assert_eq!(
+        root.parameters.as_ref().unwrap().playout_doubling_advantage,
+        1.5
+    );
+    let root_hash = root.input_hash.clone();
+    tx.send(result(root)).await.unwrap();
+    let leaf = next_eval(&mut worker).await;
+    assert_eq!(
+        leaf.position.as_ref().unwrap().next_player,
+        w::Color::White as i32
+    );
+    assert_eq!(
+        leaf.parameters.as_ref().unwrap().playout_doubling_advantage,
+        -1.5
+    );
+    let changed = request(&mut ws, json!({"id":"switch","type":"configure_search","search":{"playoutDoublingAdvantage":-0.5,"playoutDoublingAdvantagePla":"white"}})).await;
+    assert_eq!(changed["data"]["analysis"]["enabled"], true);
+    assert_eq!(changed["data"]["analysis"]["visits"], 0);
+    assert!(changed["data"]["analysis"]["root"].is_null());
+    tx.send(result(leaf)).await.unwrap(); // canceled old generation
+    let next = next_eval(&mut worker).await;
+    assert!(next.position.as_ref().unwrap().moves.is_empty());
+    assert_eq!(
+        next.parameters.as_ref().unwrap().playout_doubling_advantage,
+        0.5
+    );
+    assert_ne!(next.input_hash, root_hash);
+    let current = request(&mut ws, json!({"id":"current","type":"snapshot"})).await;
+    assert_eq!(current["data"]["analysis"]["visits"], 0);
+    request(
+        &mut ws,
+        json!({"id":"off","type":"analyze","enabled":false}),
+    )
+    .await;
+    tx.send(result(next)).await.unwrap();
+    let played = request(
+        &mut ws,
+        json!({"id":"play","type":"play","color":1,"index":60}),
+    )
+    .await;
+    assert_eq!(
+        played["data"]["settings"]["search"]["playoutDoublingAdvantagePla"],
+        "white"
+    );
+    request(
+        &mut ws,
+        json!({"id":"again","type":"analyze","enabled":true}),
+    )
+    .await;
+    let white_root = next_eval(&mut worker).await;
+    assert_eq!(
+        white_root
+            .parameters
+            .as_ref()
+            .unwrap()
+            .playout_doubling_advantage,
+        -0.5
+    );
+}
+
+#[tokio::test]
+async fn played_pda_subtrees_are_retained_and_wide_changes_do_not_reset_them() {
+    for (pda, reference) in [(0.0, "root"), (0.5, "black"), (0.5, "white"), (0.5, "root")] {
+        let mut config = SessionConfig::default();
+        config.search.max_in_flight = 1;
+        let h = Harness::configured_with_lease(config, Duration::from_secs(10)).await;
+        let (tx, mut worker) = h.worker("reuse").await;
+        let (mut ws, _) = connect_async(&h.http).await.unwrap();
+        request(&mut ws, json!({"id":"open","type":"open"})).await;
+        request(&mut ws, json!({"id":"settings","type":"configure_search","search":{
+            "playoutDoublingAdvantage":pda,"playoutDoublingAdvantagePla":reference,"wideRootNoise":0.04}})).await;
+        request(
+            &mut ws,
+            json!({"id":"start","type":"analyze","enabled":true}),
+        )
+        .await;
+        for _ in 0..15 {
+            let r = next_eval(&mut worker).await;
+            let depth = r.position.as_ref().unwrap().moves.len();
+            let mut reply = result(r);
+            if let Some(w::worker_message::Payload::Result(r)) = &mut reply.payload {
+                let policy = &mut r.output.as_mut().unwrap().policy;
+                policy.fill(0.0);
+                policy[depth] = 1.0;
+            }
+            tx.send(reply).await.unwrap();
+        }
+        let held = next_eval(&mut worker).await;
+        let paused = request(
+            &mut ws,
+            json!({"id":"pause","type":"analyze","enabled":false}),
+        )
+        .await;
+        let before = &paused["data"]["analysis"];
+        assert_eq!(before["visits"], 15);
+        assert_eq!(before["candidates"][0]["index"], 0);
+        assert_eq!(before["candidates"][0]["visits"], 14);
+        let wide = request(
+            &mut ws,
+            json!({"id":"wide","type":"configure_search","search":{"wideRootNoise":0.1}}),
+        )
+        .await;
+        assert_eq!(wide["data"]["analysis"]["visits"], before["visits"]);
+        assert_eq!(wide["data"]["analysis"]["root"], before["root"]);
+        let played = request(
+            &mut ws,
+            json!({"id":"play","type":"play","color":1,"index":0}),
+        )
+        .await;
+        let analysis = &played["data"]["analysis"];
+        let flips = pda != 0.0 && reference == "root";
+        assert_eq!(analysis["visits"], if flips { 0 } else { 14 });
+        assert_eq!(
+            analysis["rootChange"]["retained_visits"],
+            analysis["visits"]
+        );
+        assert_eq!(
+            analysis["rootChange"]["reuse_reason"],
+            if flips {
+                "pda_reference_changed"
+            } else {
+                "reused"
+            }
+        );
+        tx.send(result(held)).await.unwrap();
+        let stable = request(&mut ws, json!({"id":"stable","type":"snapshot"})).await;
+        assert_eq!(stable["data"]["analysis"]["visits"], analysis["visits"]);
+    }
+}
+
 async fn request(socket: &mut Socket, r: Value) -> Value {
     let id = r["id"].clone();
     socket
@@ -538,6 +759,17 @@ async fn memory_backpressure_retains_root_and_variation_is_read_only_with_first_
     let limited = snapshot_when(&mut ws, |v| v["analysis"]["status"] == "memory_limited").await;
     assert_eq!(limited["analysis"]["visits"], 1);
     assert_eq!(limited["analysis"]["graphNodes"], 1);
+    assert_eq!(
+        limited["analysis"]["reason"],
+        "configured search node budget reached"
+    );
+    assert_eq!(limited["analysis"]["limits"]["maxNodes"], 1);
+    assert_eq!(limited["analysis"]["nodesPerSecond"], 0.0);
+    let diagnostics = h.sessions.diagnostics();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0]["status"], "memory_limited");
+    assert_eq!(diagnostics[0]["graphNodes"], 1);
+    assert!(diagnostics[0].get("board").is_none());
     assert_eq!(
         limited["analysis"]["candidates"].as_array().unwrap().len(),
         362

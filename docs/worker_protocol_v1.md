@@ -40,7 +40,7 @@ Worker 在连接后的 5 秒内发送第一条 `WorkerMessage`，其 payload 必
 | `symmetry` | `0` |
 | `policy_temperature` / `policy_optimism` | `1` / `0` |
 | `draw_equivalent_wins_for_white` | `0.5` |
-| `playout_doubling_advantage` | `0` |
+| `playout_doubling_advantage` | 默认 `0`；会话配置后为相对当前请求 `next_player` 的有效 PDA，范围 −3～3 |
 | `max_history` | `1000` |
 | `include_ownership` / `skip_cache` | `false` / `false` |
 | `always_compute_pass_alive` / `exclude_territory_adjacent_to_atari` | `false` / `false` |
@@ -49,6 +49,8 @@ Worker 在连接后的 5 秒内发送第一条 `WorkerMessage`，其 payload 必
 `allow_terminal_search_history` 和 `force_non_terminal` 由搜索路径决定。前者仅允许重放跨过先前的普通第二次 friendly pass 终局；后者仅允许当前最终局面在同一上游谓词下继续搜索评估。它们不允许终局后任意继续、错色、非法着法、第三次 pass、Spight 重复 pass 或循环无结果。实际棋局的两次 pass 终局不因此改变。
 
 这些是影响输入和输出含义的语义参数。GPU 后端、设备、批次与精度由 Worker 部署方负责；`max_in_flight` 是应用并发容量，不等于 GPU batch。
+
+PDA 由 Server 根据 `settings.search.playoutDoublingAdvantagePla` 决定符号，Worker 必须原样传给 NN 输入，不能再次按黑／白或根视角变号。非零 PDA 纳入 Server 输入哈希，Worker 的自身 NN 缓存也必须区分该参数。宽根搜索在 Server 选边时执行，不作为 Worker 参数，不需要修改 Protobuf 版本。会话配置接口见 [JSON 协议](json_api_v1.md#会话搜索参数2026-09-22)。
 
 ## 结果与数值约定
 

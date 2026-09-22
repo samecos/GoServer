@@ -15,8 +15,15 @@ crates/go-core/REFERENCE.md
 crates/go-core/src/lib.rs
 crates/go-core/src/position.rs
 crates/go-core/src/profiling.rs
+crates/go-core/src/profiling/hotspots.rs
 crates/go-core/src/search.rs
+crates/go-core/src/search/reclamation.rs
+crates/go-core/src/search/memory.rs
+crates/go-core/src/search/memory_tests.rs
+crates/go-core/src/search/root_collection_tests.rs
 crates/go-core/src/search/scoring.rs
+crates/go-core/src/search/tuning.rs
+crates/go-core/src/search/tuning_tests.rs
 crates/go-core/src/simd.rs
 crates/go-core/src/value.rs
 crates/go-core/examples/search_bench.rs

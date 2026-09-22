@@ -10,8 +10,8 @@ mod value;
 
 pub use position::{Color, Move, Position, PositionError, Terminal};
 pub use search::{
-    Candidate, Completion, EvalToken, EvaluationRequest, ReclamationSnapshot, RootChangeMetrics,
-    Search, SearchConfig, SearchError, SearchSnapshot, SearchStep,
+    Candidate, Completion, EvalToken, EvaluationRequest, PdaPlayer, ReclamationSnapshot,
+    RootChangeMetrics, Search, SearchConfig, SearchError, SearchSnapshot, SearchStep, SearchTuning,
 };
 pub use simd::SearchSimd;
 pub use value::{Evaluation, NodeStats};

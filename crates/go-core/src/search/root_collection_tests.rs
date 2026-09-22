@@ -40,6 +40,7 @@ fn baseline(s: &mut Search) {
     s.root = remap[&s.root];
     s.index = nodes.iter().enumerate().map(|(i, n)| (n.key, i)).collect();
     s.nodes = nodes;
+    s.recount_payload();
 }
 
 fn fixture(count: usize, keep_pct: usize, slots: usize, permute: bool) -> Search {
@@ -111,6 +112,7 @@ fn fixture(count: usize, keep_pct: usize, slots: usize, permute: bool) -> Search
     }
     // A retained historical reverse link without a corresponding forward edge.
     s.nodes[id(count - 1)].parents.insert(id(root));
+    s.recount_payload();
     s
 }
 
@@ -214,6 +216,7 @@ fn late_result_and_virtual_reservations_are_cleared_before_retirement() {
     let parent = s.root;
     let child = s.nodes[parent].edges[0].child.unwrap();
     s.nodes[child].state = State::Evaluating(token);
+    s.recount_payload();
     s.reserve_path(child, &[(parent, 0)], true);
     s.pending_memory_bytes = s.position_charge(&position) * 2 + 32;
     s.pending.insert(
